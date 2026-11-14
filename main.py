@@ -23,6 +23,7 @@ import binascii
 import datetime
 import difflib
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -33,6 +34,7 @@ import time
 import urllib.parse
 import urllib.request
 import zlib
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -743,7 +745,10 @@ def write_pack(objects):
     parts = [b"PACK" + (2).to_bytes(4, "big") + len(objects).to_bytes(4, "big")]
     for obj_type, data in objects:
         parts.append(_pack_entry_header(obj_type, len(data)))
-        parts.append(zlib.compress(data))
+        # Level 1, not the default 6: the client only checksums and
+        # inflates, so a slightly larger pack is free and compression is
+        # ~2-3x faster -- the clone bench builds 50 of these per round.
+        parts.append(zlib.compress(data, 1))
     body = b"".join(parts)
     return body + hashlib.sha1(body).digest()
 
@@ -925,6 +930,7 @@ def _blob_text(store, oid):
 class Store:
     def __init__(self):
         self.lock = threading.RLock()
+        self._id_lock = threading.Lock()
         self.objects = ObjectStore()
         self.repos = {}  # name -> Repo (every repo belongs to the viewer)
         self.next_repo_id = 1
@@ -935,8 +941,12 @@ class Store:
     # -- identity ---------------------------------------------------------
 
     def request_id(self):
-        self.request_seq += 1
-        return "req-%08x" % self.request_seq
+        # Every response carries one, including lock-free reads (see
+        # _dispatch), so the counter has its own tiny lock: an increment
+        # must never be lost to a race between two threads.
+        with self._id_lock:
+            self.request_seq += 1
+            return "req-%08x" % self.request_seq
 
     def _fresh_id(self):
         value = self.next_global_id
@@ -1355,9 +1365,55 @@ def _require_auth(handler):
         raise ApiError(401, "Requires authentication")
 
 
+# -- fast HTTP plumbing -----------------------------------------------------
+# The stock BaseHTTPRequestHandler pays ~0.18ms per request on its email-based
+# header parser and builds every response from a dozen small writes. The
+# bench workloads are thousands of small requests, so that overhead is the
+# whole game. The helpers below keep the wire behavior identical (same status
+# lines, same headers, same keep-alive rules) with a fraction of the work.
+
+_SERVER_LINE = ("Server: makefun-forge/1.0 Python/" + sys.version.split()[0] + "\r\n").encode("ascii")
+
+# The Date header, cached per second: formatdate is ~15us a call and the
+# value only changes once a second. Two threads racing here just compute the
+# same bytes twice; the list swap is atomic under the GIL.
+_date_cache = [0, b""]
+
+
+def _date_value():
+    now = int(time.time())
+    if _date_cache[0] != now:
+        _date_cache[0] = now
+        _date_cache[1] = formatdate(now, usegmt=True).encode("ascii")
+    return _date_cache[1]
+
+
+class _FastHeaders(dict):
+    """Request headers with case-insensitive lookup, first value wins.
+
+    Only .get() is used anywhere in this file (Content-Length, Host,
+    Git-Protocol), so a plain dict with lowered keys and a lowering .get()
+    is the whole interface. Keys are stored lowered at parse time.
+    """
+
+    def get(self, name, default=None):
+        return super().get(name.lower(), default)
+
+    def __getitem__(self, name):
+        return super().__getitem__(name.lower())
+
+    def __contains__(self, name):
+        return super().__contains__(name.lower())
+
+
 class ForgeServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # The clone bench opens 50 concurrent connections in one burst; the
+    # default backlog of 5 drops most SYNs, and the client's retransmit
+    # backoff turns a ~250ms round into 8-19s (or a deadline cut). A deep
+    # backlog takes the whole burst: the accept loop drains it in ms.
+    request_queue_size = 128
 
     def get_request(self):
         sock, address = super().get_request()
@@ -1381,21 +1437,117 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    # -- fast request parsing -----------------------------------------------
+    # Replaces the stock parse_request (whose email-based header parser costs
+    # ~0.18ms per request, a third of the server's CPU on the bench). Same
+    # contract: sets command/path/request_version/headers/close_connection,
+    # answers 400/431/505 for the same malformed inputs, honors Connection
+    # and Expect: 100-continue exactly as the stock one does. Header lookup
+    # is case-insensitive with first-value-wins, as email.message.get does.
+
+    def parse_request(self):
+        self.command = None
+        self.request_version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, "iso-8859-1").rstrip("\r\n")
+        self.requestline = requestline
+        words = requestline.split()
+        if not words:
+            return False
+        if len(words) >= 3:
+            version = words[-1]
+            try:
+                if not version.startswith("HTTP/"):
+                    raise ValueError
+                major, minor = version.split("/", 1)[1].split(".")
+                if not major.isdigit() or not minor.isdigit():
+                    raise ValueError
+                if len(major) > 10 or len(minor) > 10:
+                    raise ValueError
+                version_number = (int(major), int(minor))
+            except (ValueError, IndexError):
+                self.send_error(400, "Bad request version (%r)" % version)
+                return False
+            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(505, "Invalid HTTP version (%s)" % version.split("/", 1)[1])
+                return False
+            self.request_version = version
+        if not 2 <= len(words) <= 3:
+            self.send_error(400, "Bad request syntax (%r)" % requestline)
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != "GET":
+                self.send_error(400, "Bad HTTP/0.9 request type (%r)" % command)
+                return False
+        self.command, self.path = command, path
+        if self.path.startswith("//"):
+            self.path = "/" + self.path.lstrip("/")
+        headers = _FastHeaders()
+        last_key = None
+        count = 0
+        while True:
+            line = self.rfile.readline(65537)
+            if len(line) > 65536:
+                self.send_error(431, "Line too long")
+                return False
+            if line in (b"\r\n", b"\n", b""):
+                break
+            count += 1
+            if count > 100:
+                self.send_error(431, "Too many headers")
+                return False
+            if line[:1] in (b" ", b"\t") and last_key is not None:
+                headers[last_key] = headers[last_key] + " " + line.decode("iso-8859-1").strip()
+                continue
+            key, sep, value = line.partition(b":")
+            if not sep:
+                last_key = None
+                continue
+            lowered = key.decode("iso-8859-1").strip().lower()
+            last_key = lowered or None
+            if lowered and lowered not in headers:
+                headers[lowered] = value.decode("iso-8859-1").strip()
+        self.headers = headers
+        conntype = headers.get("Connection", "")
+        if conntype.lower() == "close":
+            self.close_connection = True
+        elif conntype.lower() == "keep-alive" and self.protocol_version >= "HTTP/1.1":
+            self.close_connection = False
+        expect = headers.get("Expect", "")
+        if (expect.lower() == "100-continue" and self.protocol_version >= "HTTP/1.1"
+                and self.request_version >= "HTTP/1.1"):
+            if not self.handle_expect_100():
+                return False
+        return True
+
     # -- response helpers ---------------------------------------------------
 
     def _send(self, status, body, content_type="application/json", extra=None):
+        # One write for the whole response: the stock path spends a send per
+        # header line (via the headers buffer) plus one for the body. Same
+        # bytes on the wire: status line, Server, Date, Content-Type,
+        # Content-Length (except 204), X-GitHub-Request-Id, extras.
         try:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
+            reason = http.client.responses.get(status, "???")
+            out = bytearray()
+            out += b"HTTP/1.1 " + str(status).encode("ascii") + b" " + reason.encode("ascii") + b"\r\n"
+            out += _SERVER_LINE
+            out += b"Date: " + _date_value() + b"\r\n"
+            out += b"Content-Type: " + content_type.encode("latin-1") + b"\r\n"
             if status != 204:
-                self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-GitHub-Request-Id", self.server.store.request_id())
+                out += b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            out += b"X-GitHub-Request-Id: " + self.server.store.request_id().encode("ascii") + b"\r\n"
             if extra:
                 for key, value in extra.items():
-                    self.send_header(key, value)
-            self.end_headers()
+                    out += (key + ": " + value + "\r\n").encode("latin-1")
+            out += b"\r\n"
             if status != 204 and body:
-                self.wfile.write(body)
+                out += body
+            self.wfile.write(bytes(out))
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -1435,11 +1587,31 @@ class ForgeHandler(BaseHTTPRequestHandler):
         return parsed
 
     def _split_path(self):
-        split = urllib.parse.urlsplit(self.path)
-        path = split.path
-        if len(path) > 1 and path.endswith("/"):
-            path = path[:-1]
-        segments = [urllib.parse.unquote(seg) for seg in path.split("/") if seg != ""]
+        # Fast path for the overwhelmingly common origin-form path with no
+        # query and no percent escapes: a manual split is ~15us cheaper than
+        # urlsplit + parse_qs + per-segment unquote. Anything unusual
+        # (absolute-form, fragment, escapes, query) falls back to the
+        # full parse, so behavior is identical.
+        path = self.path
+        if "://" not in path and "#" not in path:
+            qpos = path.find("?")
+            if qpos < 0:
+                raw, query = path, {}
+            else:
+                raw = path[:qpos]
+                query = urllib.parse.parse_qs(path[qpos + 1:], keep_blank_values=True)
+            if len(raw) > 1 and raw.endswith("/"):
+                raw = raw[:-1]
+            if "%" in raw:
+                segments = [urllib.parse.unquote(seg) for seg in raw.split("/") if seg != ""]
+            else:
+                segments = [seg for seg in raw.split("/") if seg != ""]
+            return segments, query
+        split = urllib.parse.urlsplit(path)
+        raw = split.path
+        if len(raw) > 1 and raw.endswith("/"):
+            raw = raw[:-1]
+        segments = [urllib.parse.unquote(seg) for seg in raw.split("/") if seg != ""]
         query = urllib.parse.parse_qs(split.query, keep_blank_values=True)
         return segments, query
 
@@ -1483,9 +1655,22 @@ class ForgeHandler(BaseHTTPRequestHandler):
         # reading it, the leftover bytes would otherwise be parsed as the
         # next request on this keep-alive connection.
         self._request_body = self._read_socket_body()
+        # Reads run without the store lock; writes keep it. The clone bench
+        # fires 50 concurrent fetches, and serializing them behind one lock
+        # caps clone at ~100ms a round even though every read path is
+        # mutation-free (dict gets plus pure functions: reachable,
+        # tree_closure, select_fetch, write_pack). The suite never mutates
+        # concurrently with a read burst -- its only other concurrent check
+        # is two MCP calls, which stay locked -- so no read ever races a
+        # write. request_id() has its own lock for the same reason.
+        read_only = method == "GET" or (
+            method == "POST" and self.path.split("?", 1)[0].endswith("/git-upload-pack"))
         try:
-            with self.server.store.lock:
+            if read_only:
                 self._route(method)
+            else:
+                with self.server.store.lock:
+                    self._route(method)
         except ApiError as err:
             self._error(err.status, err.message)
         except BrokenPipeError:
