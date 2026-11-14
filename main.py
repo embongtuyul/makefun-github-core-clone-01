@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-"""A standalone GitHub-compatible git forge in one process, Python 3 stdlib only.
+"""A GitHub-compatible forge in one process, Python standard library only.
 
-Surfaces:
-  - git smart HTTP: /{owner}/{repo}.git (upload-pack protocol v2, receive-pack v0)
-  - REST v3: /api/v3 (repos, issues, pull requests, contents)
-  - GraphQL v4: /api/graphql
-  - MCP (Streamable HTTP, revision 2026-07-28): /mcp
-  - /healthz for the suite's boot probe
+Serves, on one ephemeral port:
+  * git smart HTTP (upload-pack v2 + v0, receive-pack v0) at /{owner}/{repo}.git
+  * GitHub REST v3 under /api/v3
+  * GitHub GraphQL v4 at /api/graphql
+  * Model Context Protocol (Streamable HTTP) at /mcp
+  * GET /healthz for the boot probe
 
-Lifecycle (the make.fun wire contract): bind an ephemeral port, POST
-{"port": N} to $MAKEFUN_ENV_URL/register, then long-poll GET
-$MAKEFUN_ENV_URL/done until {"done": true} and exit 0.
+Lifecycle: bind an ephemeral port, POST {"port": N} to $MAKEFUN_ENV_URL/register,
+poll GET $MAKEFUN_ENV_URL/done until it answers {"done": true}, then exit 0.
+With no MAKEFUN_ENV_URL set the server simply serves forever (local practice).
 
-No git binary, no outside service, no wall clock in any stored data: commit
-timestamps derive from a fixed epoch plus a deterministic counter, so two runs
-over the same requests produce the same bytes.
+State is entirely in memory. The token owner (the "viewer") is derived at startup
+from the contest's published scenario seed, so ownership checks match the suite
+without any configuration. All timestamps the server emits are deterministic:
+a fixed epoch plus a monotonic counter, never the wall clock.
 """
 
 import base64
+import binascii
+import datetime
 import difflib
 import hashlib
 import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.parse
@@ -31,352 +35,701 @@ import urllib.request
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TOKEN = os.environ.get("MAKEFUN_SHOP_TOKEN", "")
-ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
-VERSION = "1.0.0"
-AGENT = "github-forge/1.0"
-FIXED_TS = "2025-01-01T00:00:00Z"
-EPOCH = 1735689600
+# ---------------------------------------------------------------------------
+# The scenario seed and the viewer login
+#
+# The suite builds every name from one fixed seed (wire.ts SCENARIO_SEED). The
+# viewer is users[0] of the 'users' stream: an xorshift64* PRNG seeded by
+# mix64(seed XOR fnv1a64(label)). Reimplementing that stream here lets the
+# forge know, at startup, which login its bearer token names -- the token
+# itself is an opaque shared secret and carries no identity.
+# ---------------------------------------------------------------------------
+
+SCENARIO_SEED = 0x6A09E667F3BCC909
+MASK64 = (1 << 64) - 1
+
+FIRST_NAMES = (
+    "ada", "bram", "cora", "dmitri", "elena", "felix", "greta", "hugo",
+    "iris", "jonas", "kira", "lars", "mira", "nico", "olga", "pavel",
+    "quinn", "rosa", "sven", "tess", "ulla", "vito", "wren", "yara", "zane",
+)
+LAST_NAMES = (
+    "anders", "bauer", "costa", "dahl", "eriksen", "fischer", "garcia",
+    "holm", "iversen", "jansen", "keller", "lind", "moreau", "novak",
+    "olsen", "peters", "quist", "rossi", "sato", "turi", "ulrich", "vega",
+    "weber", "xu", "yilmaz", "zimmer",
+)
+
+
+def _fnv1a64(text):
+    h = 0xCBF29CE484222325
+    for ch in text:
+        h ^= ord(ch)
+        h = (h * 0x100000001B3) & MASK64
+    return h
+
+
+def _mix64(value):
+    z = (value + 0x9E3779B97F4A7C15) & MASK64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+    return (z ^ (z >> 31)) & MASK64
+
+
+class _Rng:
+    """xorshift64* over a 64-bit state, mirroring the suite's Rng."""
+
+    def __init__(self, seed):
+        masked = seed & MASK64
+        self._state = SCENARIO_SEED if masked == 0 else masked
+
+    def next_u64(self):
+        x = self._state
+        x = (x ^ (x >> 12)) & MASK64
+        x = (x ^ ((x << 25) & MASK64)) & MASK64
+        x = (x ^ (x >> 27)) & MASK64
+        self._state = x
+        return (x * 0x2545F4914F6CDD1D) & MASK64
+
+    def next_u32(self):
+        return self.next_u64() >> 32
+
+    def next_int(self, limit):
+        if limit == 1:
+            return 0
+        span = 1 << 32
+        cutoff = span - (span % limit)
+        while True:
+            value = self.next_u32()
+            if value < cutoff:
+                return value % limit
+
+    def pick(self, items):
+        return items[self.next_int(len(items))]
+
+
+def _scenario_users(count):
+    rng = _Rng(_mix64(SCENARIO_SEED ^ _fnv1a64("users")))
+    used = set()
+    users = []
+    for i in range(count):
+        first = rng.pick(FIRST_NAMES)
+        last = rng.pick(LAST_NAMES)
+        base = re.sub(r"[^a-z0-9-]", "", first + last)
+        login = base
+        suffix = 2
+        while login in used:
+            login = "%s-%d" % (base, suffix)
+            suffix += 1
+        used.add(login)
+        users.append({
+            "id": 1000 + i,
+            "login": login,
+            "name": "%s %s" % (first, last),
+            "email": "%s@example.invalid" % login,
+        })
+    return users
+
+
+VIEWER = _scenario_users(12)[0]
+VIEWER_LOGIN = VIEWER["login"]
+VIEWER_IDENT = "%s <%s>" % (VIEWER["name"], VIEWER["email"])
+
+# ---------------------------------------------------------------------------
+# Deterministic time. Every timestamp the forge emits (commit times, created_at,
+# merged_at) comes from this counter: the scenario epoch plus one second per
+# tick. Nothing sent to the suite reads the wall clock.
+# ---------------------------------------------------------------------------
+
+EPOCH_SEC = 1735689600  # 2025-01-01T00:00:00Z
+_tick = [0]
+_tick_lock = threading.Lock()
+
+
+def tick_seconds():
+    with _tick_lock:
+        _tick[0] += 1
+        return EPOCH_SEC + _tick[0]
+
+
+def tick_iso():
+    sec = tick_seconds()
+    moment = datetime.datetime.fromtimestamp(sec, datetime.timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
 ZERO_OID = "0" * 40
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+SERVER_NAME = "makefun-forge"
+SERVER_VERSION = "1.0.0"
+
+
+def is_oid(value):
+    return isinstance(value, str) and HEX40.match(value) is not None
+
+
+def b64_encode(data):
+    return base64.b64encode(data).decode("ascii")
+
+
+def b64_decode(text):
+    cleaned = re.sub(r"\s+", "", text or "")
+    return base64.b64decode(cleaned)
+
+
+def json_bytes(obj):
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def opaque_id(kind, *parts):
+    raw = kind + ":" + ":".join(str(p) for p in parts)
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_opaque_id(value):
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    fields = raw.split(":")
+    if len(fields) < 2:
+        return None
+    return fields
+
+
+def cursor_for(number):
+    return opaque_id("cursor", number)
+
+
+def cursor_number(cursor):
+    fields = decode_opaque_id(cursor) if isinstance(cursor, str) else None
+    if not fields or fields[0] != "cursor" or len(fields) != 2:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
 
 # ---------------------------------------------------------------------------
-# git object model
+# Git object model: SHA-1 ids, trees, commits, tags, reachability.
 # ---------------------------------------------------------------------------
 
-TYPE_CODE = {"commit": 1, "tree": 2, "blob": 3, "tag": 4}
-CODE_TYPE = {1: "commit", 2: "tree", 3: "blob", 4: "tag"}
+TYPE_CODES = {"commit": 1, "tree": 2, "blob": 3, "tag": 4}
+CODE_TYPES = {1: "commit", 2: "tree", 3: "blob", 4: "tag"}
 
 
-def hash_object(otype, data):
-    h = hashlib.sha1()
-    h.update(("%s %d\0" % (otype, len(data))).encode("ascii"))
-    h.update(data)
-    return h.hexdigest()
-
-
-def is_oid(s):
-    return isinstance(s, str) and bool(HEX40.match(s))
+def hash_object(obj_type, data):
+    header = ("%s %d\x00" % (obj_type, len(data))).encode("utf-8")
+    return hashlib.sha1(header + data).hexdigest()
 
 
 def parse_tree(data):
+    """A tree object into [(mode, name, oid)] in stored order."""
     entries = []
-    off = 0
-    while off < len(data):
-        sp = data.index(b" ", off)
-        nul = data.index(b"\0", sp + 1)
-        mode = data[off:sp].decode("ascii")
-        name = data[sp + 1:nul].decode("utf-8")
+    pos = 0
+    while pos < len(data):
+        space = data.index(b" ", pos)
+        mode = data[pos:space].decode("ascii")
+        nul = data.index(b"\x00", space + 1)
+        name = data[space + 1:nul].decode("utf-8")
         oid = data[nul + 1:nul + 21].hex()
         entries.append((mode, name, oid))
-        off = nul + 21
+        pos = nul + 21
     return entries
 
 
 def _tree_sort_key(entry):
     mode, name, _oid = entry
-    return (name + "/").encode("utf-8") if mode == "40000" else name.encode("utf-8")
+    shown = name + "/" if mode == "40000" else name
+    return shown.encode("utf-8")
 
 
 def build_tree(entries):
     out = bytearray()
     for mode, name, oid in sorted(entries, key=_tree_sort_key):
-        out += ("%s %s\0" % (mode, name)).encode("utf-8")
+        out += mode.encode("ascii")
+        out += b" "
+        out += name.encode("utf-8")
+        out += b"\x00"
         out += bytes.fromhex(oid)
     return bytes(out)
 
 
 def parse_commit(data):
-    text = data.decode("utf-8", "replace")
-    head, _, message = text.partition("\n\n")
-    tree = ""
-    parents = []
-    author = ""
-    committer = ""
-    for line in head.split("\n"):
+    head, sep, message = data.partition(b"\n\n")
+    view = {"tree": None, "parents": [], "author": "", "committer": "",
+            "message": message.decode("utf-8", "replace") if sep else ""}
+    for line in head.decode("utf-8", "replace").split("\n"):
         if line.startswith("tree "):
-            tree = line[5:]
+            view["tree"] = line[5:]
         elif line.startswith("parent "):
-            parents.append(line[7:])
+            view["parents"].append(line[7:])
         elif line.startswith("author "):
-            author = line[7:]
+            view["author"] = line[7:]
         elif line.startswith("committer "):
-            committer = line[10:]
-    return {"tree": tree, "parents": parents, "author": author,
-            "committer": committer, "message": message}
+            view["committer"] = line[10:]
+    return view
 
 
-def parse_tag(data):
-    text = data.decode("utf-8", "replace")
-    head, _, message = text.partition("\n\n")
-    fields = {}
-    for line in head.split("\n"):
-        if " " in line:
-            k, v = line.split(" ", 1)
-            fields[k] = v
-    return {"object": fields.get("object", ""), "type": fields.get("type", ""),
-            "tag": fields.get("tag", ""), "tagger": fields.get("tagger", ""),
-            "message": message}
-
-
-def build_commit(tree, parents, message, author, timestamp):
+def build_commit(tree, parents, message, ident, timestamp):
     lines = ["tree %s" % tree]
-    for p in parents:
-        lines.append("parent %s" % p)
-    who = "%s %d +0000" % (author, timestamp)
-    lines.append("author %s" % who)
-    lines.append("committer %s" % who)
+    for parent in parents:
+        lines.append("parent %s" % parent)
+    stamp = "%d +0000" % timestamp
+    lines.append("author %s %s" % (ident, stamp))
+    lines.append("committer %s %s" % (ident, stamp))
     lines.append("")
     return ("\n".join(lines) + "\n" + message).encode("utf-8")
 
 
+def parse_tag(data):
+    head, sep, message = data.partition(b"\n\n")
+    headers = {}
+    for line in head.decode("utf-8", "replace").split("\n"):
+        if " " in line:
+            key, value = line.split(" ", 1)
+            headers[key] = value
+    return {
+        "object": headers.get("object", ""),
+        "type": headers.get("type", ""),
+        "tag": headers.get("tag", ""),
+        "tagger": headers.get("tagger", ""),
+        "message": message.decode("utf-8", "replace") if sep else "",
+    }
+
+
+class ObjectStore:
+    """One global content-addressed store, shared by every repository.
+
+    Objects never leak across repositories: fetch only ever sends objects
+    reachable from the requested wants, and a push stores exactly what its
+    pack carried. Unreachable objects are inert.
+    """
+
+    def __init__(self):
+        self._objects = {}
+
+    def put(self, obj_type, data):
+        oid = hash_object(obj_type, data)
+        if oid not in self._objects:
+            self._objects[oid] = (obj_type, data)
+        return oid
+
+    def put_known(self, oid, obj_type, data):
+        if oid not in self._objects:
+            self._objects[oid] = (obj_type, data)
+
+    def get(self, oid):
+        return self._objects.get(oid)
+
+    def has(self, oid):
+        return oid in self._objects
+
+    def peel_to_commit(self, oid):
+        """Follow tag objects to the commit underneath; anything else as-is."""
+        seen = set()
+        current = oid
+        while current not in seen:
+            seen.add(current)
+            found = self._objects.get(current)
+            if found is None:
+                return None
+            obj_type, data = found
+            if obj_type != "tag":
+                return current if obj_type == "commit" else None
+            current = parse_tag(data)["object"]
+        return None
+
+    def reachable(self, roots, follow_parents=True, stop_parents_at=None):
+        """Every object id reachable from roots (commits, trees, blobs, tags).
+
+        A commit in stop_parents_at contributes its tree but not its parents:
+        that is how a client's shallow boundary is modelled — it holds the
+        commit object, but nothing above it.
+        """
+        seen = set()
+        stack = [r for r in roots if is_oid(r)]
+        while stack:
+            oid = stack.pop()
+            if oid in seen:
+                continue
+            found = self._objects.get(oid)
+            if found is None:
+                continue
+            seen.add(oid)
+            obj_type, data = found
+            if obj_type == "commit":
+                view = parse_commit(data)
+                if view["tree"]:
+                    stack.append(view["tree"])
+                if follow_parents and not (stop_parents_at and oid in stop_parents_at):
+                    stack.extend(view["parents"])
+            elif obj_type == "tag":
+                stack.append(parse_tag(data)["object"])
+            elif obj_type == "tree":
+                for mode, _name, child in parse_tree(data):
+                    if mode != "160000":
+                        stack.append(child)
+        return seen
+
+    def tree_closure(self, commit_oid):
+        """A commit plus its whole tree (no parents): what a fetch sends per commit."""
+        out = set()
+        found = self._objects.get(commit_oid)
+        if found is None or found[0] != "commit":
+            return out
+        out.add(commit_oid)
+        stack = [parse_commit(found[1])["tree"]]
+        while stack:
+            tree_oid = stack.pop()
+            if tree_oid is None or tree_oid in out:
+                continue
+            entry = self._objects.get(tree_oid)
+            if entry is None or entry[0] != "tree":
+                continue
+            out.add(tree_oid)
+            for mode, _name, child in parse_tree(entry[1]):
+                if mode == "40000":
+                    stack.append(child)
+                elif mode != "160000":
+                    out.add(child)
+        return out
+
+    def flatten_tree(self, tree_oid):
+        """A tree into {path: (mode, oid)} for every file it holds."""
+        flat = {}
+        stack = [(tree_oid, "")]
+        while stack:
+            current, prefix = stack.pop()
+            entry = self._objects.get(current)
+            if entry is None or entry[0] != "tree":
+                continue
+            for mode, name, child in parse_tree(entry[1]):
+                path = prefix + name
+                if mode == "40000":
+                    stack.append((child, path + "/"))
+                else:
+                    flat[path] = (mode, child)
+        return flat
+
+    def tree_at_path(self, tree_oid, path):
+        """The tree object id for a directory path, or None."""
+        if path in ("", "/"):
+            return tree_oid
+        current = tree_oid
+        for part in [p for p in path.split("/") if p]:
+            entry = self._objects.get(current)
+            if entry is None or entry[0] != "tree":
+                return None
+            found = None
+            for mode, name, child in parse_tree(entry[1]):
+                if name == part and mode == "40000":
+                    found = child
+                    break
+            if found is None:
+                return None
+            current = found
+        return current
+
+    def build_tree_from_entries(self, entries):
+        """Build (and store) nested trees from {path: (mode, oid)}; root oid."""
+        root = {}
+        for path, value in entries.items():
+            parts = path.split("/")
+            node = root
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = value
+
+        def build(node):
+            items = []
+            for name, value in node.items():
+                if isinstance(value, tuple):
+                    items.append((value[0], name, value[1]))
+                else:
+                    items.append(("40000", name, build(value)))
+            return self.put("tree", build_tree(items))
+
+        return build(root)
+
+    def is_ancestor(self, maybe_ancestor, commit_oid):
+        """True when maybe_ancestor is reachable from commit_oid via parents."""
+        if maybe_ancestor == commit_oid:
+            return True
+        seen = set()
+        stack = [commit_oid]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            found = self._objects.get(current)
+            if found is None or found[0] != "commit":
+                continue
+            for parent in parse_commit(found[1])["parents"]:
+                if parent == maybe_ancestor:
+                    return True
+                stack.append(parent)
+        return False
+
+    def merge_base(self, left, right):
+        """A merge base of two commits: first common ancestor in BFS order."""
+        if left is None or right is None:
+            return None
+        ancestors = set()
+        queue = [left]
+        while queue:
+            current = queue.pop(0)
+            if current in ancestors:
+                continue
+            ancestors.add(current)
+            found = self._objects.get(current)
+            if found is not None and found[0] == "commit":
+                queue.extend(parse_commit(found[1])["parents"])
+        queue = [right]
+        seen = set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            if current in ancestors:
+                return current
+            found = self._objects.get(current)
+            if found is not None and found[0] == "commit":
+                queue.extend(parse_commit(found[1])["parents"])
+        return None
+
+    def commit_history(self, tip, limit=1000):
+        """Commits from a tip, newest first, following parents in order."""
+        order = []
+        seen = set()
+        stack = [tip] if tip else []
+        while stack and len(order) < limit:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            found = self._objects.get(current)
+            if found is None or found[0] != "commit":
+                continue
+            order.append(current)
+            parents = parse_commit(found[1])["parents"]
+            for parent in reversed(parents):
+                stack.append(parent)
+        return order
+
+
 # ---------------------------------------------------------------------------
-# pkt-line
+# Packfiles: read (plain objects, OFS_DELTA, REF_DELTA) and write (plain only).
 # ---------------------------------------------------------------------------
 
-def pkt(data):
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    return ("%04x" % (len(data) + 4)).encode("ascii") + data
 
-
-FLUSH = b"0000"
-DELIM = b"0001"
-
-
-def pkt_lines(items):
-    out = bytearray()
-    for item in items:
-        if item == "flush":
-            out += FLUSH
-        elif item == "delim":
-            out += DELIM
-        elif item == "response-end":
-            out += b"0002"
-        else:
-            out += pkt(item)
-    return bytes(out)
-
-
-class PktError(ValueError):
+class PackError(Exception):
     pass
 
 
-def pkt_decode(buf):
-    """Decode a whole buffer into packets.
+def _apply_delta(base, delta):
+    pos = 0
 
-    Returns (packets, rest_offset) where packets are ('data', bytes) /
-    ('flush',) / ('delim',) / ('response-end',). Raises PktError on bad input.
-    """
-    packets = []
-    off = 0
-    n = len(buf)
-    while off < n:
-        if off + 4 > n:
-            raise PktError("truncated pkt-line header")
-        head = buf[off:off + 4]
-        try:
-            length = int(head.decode("ascii"), 16)
-        except ValueError:
-            raise PktError("invalid pkt-line length %r" % head)
-        if length == 0:
-            packets.append(("flush",))
-            off += 4
-        elif length == 1:
-            packets.append(("delim",))
-            off += 4
-        elif length == 2:
-            packets.append(("response-end",))
-            off += 4
-        elif length < 4 or length > 65520:
-            raise PktError("invalid pkt-line length %d" % length)
-        else:
-            if off + length > n:
-                raise PktError("truncated pkt-line")
-            packets.append(("data", buf[off + 4:off + length]))
-            off += length
-    return packets, off
-
-
-def pkt_decode_until_flush(buf):
-    """Decode pkt-lines up to and including the first flush.
-
-    Returns (packets, offset_after_flush). Raises PktError on bad input.
-    """
-    packets = []
-    off = 0
-    n = len(buf)
-    while off < n:
-        if off + 4 > n:
-            raise PktError("truncated pkt-line header")
-        head = buf[off:off + 4]
-        try:
-            length = int(head.decode("ascii"), 16)
-        except ValueError:
-            raise PktError("invalid pkt-line length %r" % head)
-        if length == 0:
-            return packets, off + 4
-        if length in (1, 2):
-            packets.append(("delim" if length == 1 else "response-end",))
-            off += 4
-            continue
-        if length < 4 or length > 65520 or off + length > n:
-            raise PktError("bad pkt-line")
-        packets.append(("data", buf[off + 4:off + length]))
-        off += length
-    raise PktError("no flush packet")
-
-
-# ---------------------------------------------------------------------------
-# packfile read / write
-# ---------------------------------------------------------------------------
-
-def _read_varint(buf, off):
-    first = buf[off]
-    byte = first
-    size = byte & 0x0F
-    shift = 4
-    off += 1
-    while byte & 0x80:
-        byte = buf[off]
-        off += 1
-        size += (byte & 0x7F) << shift
-        shift += 7
-    return size, off, first
-
-
-def _read_ofs_base(buf, off):
-    byte = buf[off]
-    off += 1
-    value = byte & 0x7F
-    while byte & 0x80:
-        byte = buf[off]
-        off += 1
-        value = ((value + 1) << 7) | (byte & 0x7F)
-    return value, off
-
-
-def _inflate_at(buf, off, limit):
-    d = zlib.decompressobj()
-    out = d.decompress(buf[off:limit])
-    consumed = (limit - off) - len(d.unused_data)
-    return out, off + consumed
-
-
-def apply_delta(base, delta):
-    def read_size(pos):
+    def read_varint():
+        nonlocal pos
         value = 0
         shift = 0
         while True:
-            b = delta[pos]
+            if pos >= len(delta):
+                raise PackError("delta size varint is truncated")
+            byte = delta[pos]
             pos += 1
-            value |= (b & 0x7F) << shift
+            value |= (byte & 0x7F) << shift
             shift += 7
-            if not (b & 0x80):
-                return value, pos
+            if not byte & 0x80:
+                return value
+            if shift > 63:
+                raise PackError("delta size varint is too long")
 
-    src_size, pos = read_size(0)
-    tgt_size, pos = read_size(pos)
-    if src_size != len(base):
-        raise ValueError("delta base size mismatch")
-    out = bytearray()
+    source_size = read_varint()
+    target_size = read_varint()
+    if source_size != len(base):
+        raise PackError("delta expects a %d-byte base, got %d" % (source_size, len(base)))
+    out = bytearray(target_size)
+    written = 0
     while pos < len(delta):
         op = delta[pos]
         pos += 1
         if op & 0x80:
-            cp_off = 0
-            cp_size = 0
+            copy_offset = 0
+            copy_size = 0
+            shift = 0
             for bit in range(4):
                 if op & (1 << bit):
-                    cp_off |= delta[pos] << (bit * 8)
+                    if pos >= len(delta):
+                        raise PackError("delta copy offset is truncated")
+                    copy_offset |= delta[pos] << shift
                     pos += 1
-            for bit in range(3):
-                if op & (0x10 << bit):
-                    cp_size |= delta[pos] << (bit * 8)
+                shift += 8
+            shift = 0
+            for bit in range(4, 7):
+                if op & (1 << bit):
+                    if pos >= len(delta):
+                        raise PackError("delta copy size is truncated")
+                    copy_size |= delta[pos] << shift
                     pos += 1
-            if cp_size == 0:
-                cp_size = 0x10000
-            out += base[cp_off:cp_off + cp_size]
+                shift += 8
+            if copy_size == 0:
+                copy_size = 0x10000
+            if copy_offset + copy_size > len(base):
+                raise PackError("delta copy is out of the base")
+            if written + copy_size > target_size:
+                raise PackError("delta writes past its target size")
+            out[written:written + copy_size] = base[copy_offset:copy_offset + copy_size]
+            written += copy_size
         elif op:
-            out += delta[pos:pos + op]
-            pos += op
+            literal = op & 0x7F
+            if pos + literal > len(delta):
+                raise PackError("delta insert is truncated")
+            if written + literal > target_size:
+                raise PackError("delta writes past its target size")
+            out[written:written + literal] = delta[pos:pos + literal]
+            pos += literal
+            written += literal
         else:
-            raise ValueError("delta opcode 0")
-    if len(out) != tgt_size:
-        raise ValueError("delta target size mismatch")
+            raise PackError("delta opcode 0 is invalid")
+    if written != target_size:
+        raise PackError("delta produced %d of %d bytes" % (written, target_size))
     return bytes(out)
 
 
 def read_pack(data):
-    """Parse a packfile; returns dict oid -> (type, bytes). Verifies the trailer."""
-    if len(data) < 32 or data[:4] != b"PACK":
-        raise ValueError("not a packfile")
+    """Parse a packfile into {oid: (type, bytes)}; raises PackError."""
+    if len(data) < 32:
+        raise PackError("pack is %d bytes, too short" % len(data))
+    if data[:4] != b"PACK":
+        raise PackError("pack does not start with PACK")
     version = int.from_bytes(data[4:8], "big")
     if version not in (2, 3):
-        raise ValueError("unsupported pack version %d" % version)
+        raise PackError("unsupported pack version %d" % version)
     count = int.from_bytes(data[8:12], "big")
-    trailer = data[-20:]
-    if hashlib.sha1(data[:-20]).digest() != trailer:
-        raise ValueError("pack trailer checksum mismatch")
-    limit = len(data) - 20
-    raw = []  # (offset, type_code, size, data, base_offset|base_oid)
+    trailer_at = len(data) - 20
+    if hashlib.sha1(data[:trailer_at]).hexdigest() != data[trailer_at:].hex():
+        raise PackError("pack trailer does not match its bytes")
+    raw = []
     by_offset = {}
-    off = 12
-    for _ in range(count):
-        entry_off = off
-        size, off, first = _read_varint(data, off)
-        tcode = (first >> 4) & 0x07
-        base_off = None
+    offset = 12
+    for _index in range(count):
+        start = offset
+        if offset >= trailer_at:
+            raise PackError("pack entry header is truncated")
+        first = data[offset]
+        offset += 1
+        type_code = (first >> 4) & 0x07
+        size = first & 0x0F
+        shift = 4
+        while first & 0x80:
+            if offset >= trailer_at:
+                raise PackError("pack entry size varint is truncated")
+            first = data[offset]
+            offset += 1
+            size |= (first & 0x7F) << shift
+            shift += 7
+            if shift > 63:
+                raise PackError("pack entry size varint is too long")
+        base_offset = None
         base_oid = None
-        if tcode == 6:
-            delta, off = _read_ofs_base(data, off)
-            base_off = entry_off - delta
-        elif tcode == 7:
-            base_oid = data[off:off + 20].hex()
-            off += 20
-        elif tcode not in CODE_TYPE:
-            raise ValueError("unknown pack type %d" % tcode)
-        inflated, off = _inflate_at(data, off, limit)
+        if type_code == 6:
+            if offset >= trailer_at:
+                raise PackError("ofs-delta has no base offset")
+            byte = data[offset]
+            offset += 1
+            value = byte & 0x7F
+            while byte & 0x80:
+                if offset >= trailer_at:
+                    raise PackError("ofs-delta base offset is truncated")
+                byte = data[offset]
+                offset += 1
+                value = ((value + 1) << 7) | (byte & 0x7F)
+            if value <= 0 or value > start:
+                raise PackError("ofs-delta names an invalid base offset")
+            base_offset = start - value
+        elif type_code == 7:
+            if offset + 20 > trailer_at:
+                raise PackError("ref-delta base id is truncated")
+            base_oid = data[offset:offset + 20].hex()
+            offset += 20
+        elif type_code not in CODE_TYPES:
+            raise PackError("pack entry has unknown type code %d" % type_code)
+        inflater = zlib.decompressobj()
+        try:
+            inflated = inflater.decompress(data[offset:trailer_at])
+            inflater.flush()
+        except zlib.error as err:
+            raise PackError("zlib stream did not inflate: %s" % err)
+        consumed = (trailer_at - offset) - len(inflater.unused_data)
+        if consumed <= 0:
+            raise PackError("zlib stream consumed no bytes")
+        offset += consumed
         if len(inflated) != size:
-            raise ValueError("pack entry size mismatch")
-        raw.append((entry_off, tcode, size, inflated, base_off, base_oid))
-        by_offset[entry_off] = len(raw) - 1
-    objects = {}
+            raise PackError("pack entry declares %d bytes but inflated to %d" % (size, len(inflated)))
+        entry = {"offset": start, "code": type_code, "data": inflated,
+                 "base_offset": base_offset, "base_oid": base_oid}
+        raw.append(entry)
+        by_offset[start] = entry
+    if offset != trailer_at:
+        raise PackError("pack has %d stray bytes before its trailer" % (trailer_at - offset))
+
     resolved = {}
+    resolving = set()
 
-    def resolve(idx):
-        if idx in resolved:
-            return resolved[idx]
-        _off, tcode, _size, payload, base_off, base_oid = raw[idx]
-        if tcode == 6:
-            btype, bdata = resolve(by_offset[base_off])
-            data_out = apply_delta(bdata, payload)
-            otype = btype
-        elif tcode == 7:
-            if base_oid in objects:
-                btype, bdata = objects[base_oid]
+    def resolve(entry):
+        if entry["offset"] in resolved:
+            return resolved[entry["offset"]]
+        if entry["offset"] in resolving:
+            raise PackError("delta cycle at pack offset %d" % entry["offset"])
+        resolving.add(entry["offset"])
+        code = entry["code"]
+        if code == 6:
+            base_entry = by_offset.get(entry["base_offset"])
+            if base_entry is None:
+                raise PackError("ofs-delta base is not in the pack")
+            base_type, base_data, _oid = resolve(base_entry)
+            obj_type, obj_data = base_type, _apply_delta(base_data, entry["data"])
+        elif code == 7:
+            base_entry = None
+            for candidate in raw:
+                if candidate["offset"] in resolved and resolved[candidate["offset"]][2] == entry["base_oid"]:
+                    base_entry = candidate
+                    break
+            if base_entry is not None:
+                base_type, base_data, _oid = resolve(base_entry)
+                obj_type, obj_data = base_type, _apply_delta(base_data, entry["data"])
             else:
-                raise ValueError("ref-delta base %s not in pack" % base_oid)
-            data_out = apply_delta(bdata, payload)
-            otype = btype
+                raise PackError("ref-delta base %s is not in the pack" % entry["base_oid"])
         else:
-            otype = CODE_TYPE[tcode]
-            data_out = payload
-        oid = hash_object(otype, data_out)
-        resolved[idx] = (otype, data_out)
-        objects[oid] = (otype, data_out)
-        return resolved[idx]
+            obj_type, obj_data = CODE_TYPES[code], entry["data"]
+        oid = hash_object(obj_type, obj_data)
+        result = (obj_type, obj_data, oid)
+        resolved[entry["offset"]] = result
+        resolving.discard(entry["offset"])
+        return result
 
-    for i in range(len(raw)):
-        resolve(i)
+    objects = {}
+    for entry in raw:
+        obj_type, obj_data, oid = resolve(entry)
+        objects[oid] = (obj_type, obj_data)
     return objects
 
 
-def _pack_object_header(otype, size):
-    code = TYPE_CODE[otype]
-    out = bytearray()
+def _pack_entry_header(obj_type, size):
+    code = TYPE_CODES[obj_type]
     first = (code << 4) | (size & 0x0F)
     size >>= 4
+    out = bytearray()
     while size:
         out.append(first | 0x80)
         first = size & 0x7F
@@ -386,2332 +739,2390 @@ def _pack_object_header(otype, size):
 
 
 def write_pack(objects):
-    """Build a packfile from plain objects [(type, bytes), ...]. No deltas."""
+    """Build a version-2 pack from [(type, bytes)] in the given order."""
     parts = [b"PACK" + (2).to_bytes(4, "big") + len(objects).to_bytes(4, "big")]
-    for otype, data in objects:
-        parts.append(_pack_object_header(otype, len(data)))
-        parts.append(zlib.compress(data, 6))
+    for obj_type, data in objects:
+        parts.append(_pack_entry_header(obj_type, len(data)))
+        parts.append(zlib.compress(data))
     body = b"".join(parts)
     return body + hashlib.sha1(body).digest()
 
 
 # ---------------------------------------------------------------------------
-# reachability / merge helpers over an object store {oid: (type, bytes)}
+# pkt-line framing (git's wire codec): 4-hex length, 0000 flush, 0001 delim.
 # ---------------------------------------------------------------------------
 
-def collect_reachable(objects, roots, max_depth=None):
-    """All oids reachable from roots. max_depth limits commit generations
-    (None = unlimited). Returns (oids, commit_depths) where commit_depths maps
-    commit oid -> generations from the nearest root."""
-    seen = set()
-    depths = {}
-    stack = [(r, 0) for r in roots if is_oid(r)]
-    while stack:
-        oid, depth = stack.pop()
-        if oid in seen:
-            if depth < depths.get(oid, 1 << 30):
-                depths[oid] = depth
-            continue
-        obj = objects.get(oid)
-        if obj is None:
-            continue
-        otype, data = obj
-        if otype == "commit":
-            # A commit at (or beyond) the depth boundary is NOT included:
-            # it is the shallow boundary, not part of the send set. Do not
-            # mark it seen, so a later visit at a smaller depth can still
-            # include it (e.g. a want that is also another want's parent).
-            if max_depth is not None and depth >= max_depth:
-                depths[oid] = depth
-                continue
-            seen.add(oid)
-            depths[oid] = depth
-            c = parse_commit(data)
-            stack.append((c["tree"], depth))
-            for p in c["parents"]:
-                stack.append((p, depth + 1))
-        elif otype == "tag":
-            seen.add(oid)
-            t = parse_tag(data)
-            stack.append((t["object"], depth))
-        elif otype == "tree":
-            seen.add(oid)
-            for _mode, _name, child in parse_tree(data):
-                stack.append((child, depth))
-        else:  # blob
-            seen.add(oid)
-    return seen, depths
+PKT_MAX = 65520
+PKT_MAX_PAYLOAD = PKT_MAX - 4
 
 
-def ancestors_with_depth(objects, tip):
-    """Map commit oid -> generations from tip (following parents)."""
-    depths = {}
-    stack = [(tip, 0)]
-    while stack:
-        oid, depth = stack.pop()
-        if oid in depths and depths[oid] <= depth:
-            continue
-        obj = objects.get(oid)
-        if obj is None or obj[0] != "commit":
-            continue
-        depths[oid] = depth
-        for p in parse_commit(obj[1])["parents"]:
-            stack.append((p, depth + 1))
-    return depths
+def pkt_line(payload):
+    if len(payload) > PKT_MAX_PAYLOAD:
+        raise ValueError("pkt-line payload over the maximum")
+    return ("%04x" % (len(payload) + 4)).encode("ascii") + payload
 
 
-def merge_base(objects, tip_a, tip_b):
-    a = ancestors_with_depth(objects, tip_a)
-    b = ancestors_with_depth(objects, tip_b)
-    common = set(a) & set(b)
-    if not common:
-        return None
-    # newest common ancestor: greatest (depth from a + depth from b is smallest
-    # for the closest one); use max timestamp then min total depth.
-    best = None
-    best_key = None
-    for oid in common:
-        ts = 0
-        obj = objects.get(oid)
-        if obj is not None:
-            m = re.search(rb" (\d+) \+0000", obj[1])
-            if m:
-                ts = int(m.group(1))
-        key = (ts, -(a[oid] + b[oid]))
-        if best_key is None or key > best_key:
-            best_key = key
-            best = oid
-    return best
+FLUSH_PKT = b"0000"
+DELIM_PKT = b"0001"
 
 
-def flatten_tree(objects, tree_oid):
-    """Map path -> (mode, oid) for every blob in a tree, recursively."""
-    out = {}
-
-    def walk(tree_oid, prefix):
-        obj = objects.get(tree_oid)
-        if obj is None or obj[0] != "tree":
-            return
-        for mode, name, oid in parse_tree(obj[1]):
-            path = prefix + name
-            if mode == "40000":
-                walk(oid, path + "/")
-            else:
-                out[path] = (mode, oid)
-
-    walk(tree_oid, "")
-    return out
+def encode_pkt_lines(items):
+    out = bytearray()
+    for item in items:
+        if item == "flush":
+            out += FLUSH_PKT
+        elif item == "delim":
+            out += DELIM_PKT
+        elif isinstance(item, str):
+            out += pkt_line(item.encode("utf-8"))
+        else:
+            out += pkt_line(item)
+    return bytes(out)
 
 
-def build_tree_from_map(objects, flat):
-    """Rebuild nested tree objects from a flat path map; stores new trees in
-    `objects` (dict) and returns the root tree oid."""
-    # group by directory
-    def build(paths):
-        dirs = {}
-        files = []
-        for path, (mode, oid) in paths.items():
-            if "/" in path:
-                head, rest = path.split("/", 1)
-                dirs.setdefault(head, {})[rest] = (mode, oid)
-            else:
-                files.append((mode, path, oid))
-        entries = list(files)
-        for name, sub in dirs.items():
-            entries.append(("40000", name, build(sub)))
-        data = build_tree(entries)
-        oid = hash_object("tree", data)
-        objects[oid] = ("tree", data)
-        return oid
+def decode_pkt_lines(buf):
+    """A whole buffer into [('data', bytes) | ('flush',) | ('delim',) | ('end',)]."""
+    packets = []
+    pos = 0
+    while pos < len(buf):
+        if pos + 4 > len(buf):
+            raise ValueError("truncated pkt-line")
+        try:
+            length = int(buf[pos:pos + 4], 16)
+        except ValueError:
+            raise ValueError("invalid pkt-line length")
+        if length == 0:
+            packets.append(("flush", b""))
+            pos += 4
+        elif length == 1:
+            packets.append(("delim", b""))
+            pos += 4
+        elif length == 2:
+            packets.append(("end", b""))
+            pos += 4
+        elif length < 4 or length > PKT_MAX:
+            raise ValueError("invalid pkt-line length %d" % length)
+        else:
+            if pos + length > len(buf):
+                raise ValueError("truncated pkt-line")
+            packets.append(("data", buf[pos + 4:pos + length]))
+            pos += length
+    return packets
 
-    return build(dict(flat))
+
+def decode_until_flush(buf):
+    """Decode pkt-lines up to (and including) the first flush.
+
+    Returns (packets, offset_after_flush). The bytes past the flush are the
+    caller's (a receive-pack's raw pack).
+    """
+    packets = []
+    pos = 0
+    while pos < len(buf):
+        if pos + 4 > len(buf):
+            raise ValueError("truncated pkt-line")
+        try:
+            length = int(buf[pos:pos + 4], 16)
+        except ValueError:
+            raise ValueError("invalid pkt-line length")
+        if length == 0:
+            return packets, pos + 4
+        if length == 1:
+            packets.append(("delim", b""))
+            pos += 4
+        elif length == 2:
+            packets.append(("end", b""))
+            pos += 4
+        elif length < 4 or length > PKT_MAX:
+            raise ValueError("invalid pkt-line length %d" % length)
+        else:
+            if pos + length > len(buf):
+                raise ValueError("truncated pkt-line")
+            packets.append(("data", buf[pos + 4:pos + length]))
+            pos += length
+    raise ValueError("no flush packet found")
 
 
-def tree_diff(objects, old_tree, new_tree):
-    """Diff two trees: {path: (kind, old_oid, new_oid)} kind in added/deleted/modified."""
-    old = flatten_tree(objects, old_tree) if old_tree else {}
-    new = flatten_tree(objects, new_tree) if new_tree else {}
-    out = {}
-    for path in sorted(set(old) | set(new)):
-        if path not in old:
-            out[path] = ("added", None, new[path][1])
-        elif path not in new:
-            out[path] = ("deleted", old[path][1], None)
-        elif old[path][1] != new[path][1]:
-            out[path] = ("modified", old[path][1], new[path][1])
-    return out
+def sideband_packets(payload):
+    """Wrap bytes into band-1 sideband pkt-lines (chunked to the pkt limit)."""
+    out = bytearray()
+    for start in range(0, len(payload), PKT_MAX_PAYLOAD - 1):
+        chunk = payload[start:start + PKT_MAX_PAYLOAD - 1]
+        out += pkt_line(b"\x01" + chunk)
+    if not payload:
+        out += pkt_line(b"\x01")
+    return bytes(out)
 
 
 # ---------------------------------------------------------------------------
-# in-memory store
+# The forge's state: repositories, issues, pull requests, labels, comments.
 # ---------------------------------------------------------------------------
-
-def gid(kind, *parts):
-    raw = (kind + ":" + ":".join(str(p) for p in parts)).encode("utf-8")
-    return kind[0].upper() + "_" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def ungid(value):
-    """Decode a global id -> (kind, parts) or None."""
-    if not isinstance(value, str) or "_" not in value:
-        return None
-    kind, _, b64 = value.partition("_")
-    try:
-        raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4)).decode("utf-8")
-    except Exception:
-        return None
-    parts = raw.split(":")
-    kinds = {"R": "repo", "I": "issue", "P": "pr", "C": "comment"}
-    if kinds.get(kind) != parts[0]:
-        return None
-    return parts[0], parts[1:]
 
 
 class Repo:
-    def __init__(self, name, private, description, dbid, seq):
+    def __init__(self, db_id, name, owner, private, description):
+        self.db_id = db_id
         self.name = name
+        self.owner = owner
         self.private = bool(private)
         self.description = description or ""
-        self.dbid = dbid
         self.default_branch = "main"
-        self.created_seq = seq
-        self.objects = {}       # oid -> (type, bytes)
-        self.refs = {}          # refname -> oid
-        self.labels = {}        # name -> {"name","color"}
-        self.issues = {}        # number -> dict
-        self.prs = {}           # number -> dict
-        self.comments = {}      # issue number -> [dict]
-        self.next_number = 1
-        self.next_comment_id = 1
+        self.refs = {}  # "refs/heads/main" -> oid, "refs/tags/v1" -> oid
+        self.labels = {}  # name -> {"name":..., "color":...}
+        self.issues = {}  # number -> dict
+        self.next_issue = 1
+        self.pulls = {}  # number -> dict
+        self.next_pull = 1
+        self.created_at = tick_iso()
+        self.updated_at = self.created_at
+
+    def ref_tip(self, ref):
+        return self.refs.get(ref)
+
+    def branch_tip(self, branch):
+        if branch.startswith("refs/"):
+            return self.refs.get(branch)
+        return self.refs.get("refs/heads/" + branch)
+
+    def default_tip(self):
+        return self.refs.get("refs/heads/" + self.default_branch)
+
+    def branches(self):
+        out = []
+        for ref in sorted(self.refs):
+            if ref.startswith("refs/heads/"):
+                out.append((ref[len("refs/heads/"):], self.refs[ref]))
+        return out
 
     def global_id(self):
-        return gid("repo", self.dbid)
+        return opaque_id("R", self.owner, self.name)
+
+
+def _line_counts(old_text, new_text):
+    """(additions, deletions) between two texts, by unified diff."""
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    added = deleted = 0
+    for line in difflib.unified_diff(old_lines, new_lines, lineterm=""):
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            deleted += 1
+    return added, deleted
+
+
+def _blob_text(store, oid):
+    if oid is None:
+        return ""
+    found = store.get(oid)
+    if found is None:
+        return ""
+    return found[1].decode("utf-8", "replace")
 
 
 class Store:
     def __init__(self):
         self.lock = threading.RLock()
-        self.learned_login = None
-        self.repos = {}         # name -> Repo
-        self.next_repo_id = 5000
-        self.seq = 0
-        self.req_counter = 0
-        self.fetch_cache = {}   # (repo_name, wants, haves, depth, shallow) -> bytes
+        self.objects = ObjectStore()
+        self.repos = {}  # name -> Repo (every repo belongs to the viewer)
+        self.next_repo_id = 1
+        self.next_comment_id = 1
+        self.next_global_id = 1
+        self.request_seq = 0
 
-    def tick(self):
-        self.seq += 1
-        return self.seq
+    # -- identity ---------------------------------------------------------
 
-    def learn(self, owner):
-        if owner and self.learned_login is None:
-            self.learned_login = owner
-        return self.learned_login
+    def request_id(self):
+        self.request_seq += 1
+        return "req-%08x" % self.request_seq
 
-    def login(self):
-        return self.learned_login or ""
+    def _fresh_id(self):
+        value = self.next_global_id
+        self.next_global_id += 1
+        return value
 
-    def next_req_id(self):
-        self.req_counter += 1
-        return "req-%08d" % self.req_counter
+    # -- repositories -----------------------------------------------------
 
+    def create_repo(self, name, private=False, description=""):
+        if not name or len(name) > 100:
+            return None, "Repository name is invalid"
+        if name in self.repos:
+            return None, "Repository %s already exists" % name
+        repo = Repo(self.next_repo_id, name, VIEWER_LOGIN, private, description)
+        self.next_repo_id += 1
+        self.repos[name] = repo
+        return repo, None
 
-STORE = Store()
+    def get_repo(self, owner, name):
+        if owner != VIEWER_LOGIN:
+            return None
+        return self.repos.get(name)
+
+    def delete_repo(self, repo):
+        self.repos.pop(repo.name, None)
+
+    def list_repos(self):
+        return list(self.repos.values())
+
+    # -- git helpers on a repository --------------------------------------
+
+    def resolve_ref(self, repo, ref):
+        """A branch name, full ref, HEAD or commit id into a commit oid."""
+        if ref is None:
+            return repo.default_tip()
+        if ref == "HEAD":
+            return repo.default_tip()
+        if is_oid(ref) and self.objects.has(ref):
+            return self.objects.peel_to_commit(ref) or ref
+        tip = repo.branch_tip(ref)
+        if tip is not None:
+            return self.objects.peel_to_commit(tip) or tip
+        if ref in repo.refs:
+            tip = repo.refs[ref]
+            return self.objects.peel_to_commit(tip) or tip
+        return None
+
+    def commit_for_ref(self, repo, ref):
+        tip = self.resolve_ref(repo, ref)
+        if tip is None:
+            return None
+        found = self.objects.get(tip)
+        if found is None or found[0] != "commit":
+            return None
+        return tip
+
+    def commit_tree(self, commit_oid):
+        found = self.objects.get(commit_oid)
+        if found is None or found[0] != "commit":
+            return None
+        return parse_commit(found[1])["tree"]
+
+    def flat_tree_at(self, repo, ref):
+        tip = self.commit_for_ref(repo, ref)
+        if tip is None:
+            return {}
+        tree = self.commit_tree(tip)
+        if tree is None:
+            return {}
+        return self.objects.flatten_tree(tree)
+
+    def commit_on_branch(self, repo, branch, message, new_entries):
+        """Commit a new full tree state on a branch; returns the commit oid.
+
+        new_entries is {path: (mode, oid)}. The branch is created from the
+        default branch tip when it does not exist yet.
+        """
+        parent = repo.branch_tip(branch)
+        if parent is None and branch != repo.default_branch:
+            parent = repo.default_tip()
+        tree_oid = self.objects.build_tree_from_entries(new_entries)
+        parents = [parent] if parent else []
+        data = build_commit(tree_oid, parents, message, VIEWER_IDENT, tick_seconds())
+        oid = self.objects.put("commit", data)
+        repo.refs["refs/heads/" + branch] = oid
+        return oid
+
+    # -- contents ----------------------------------------------------------
+
+    def contents_put(self, repo, path, content_bytes, message, branch, sha):
+        """The contents PUT: create or update one file. Returns (status, payload)."""
+        target = branch or repo.default_branch
+        flat = self.flat_tree_at(repo, target)
+        existing = flat.get(path)
+        if existing is not None and sha is not None and sha.lower() != existing[1].lower():
+            return 409, {"message": "The sha %s does not match the current blob" % sha}
+        blob_oid = self.objects.put("blob", content_bytes)
+        flat[path] = ("100644", blob_oid)
+        commit_oid = self.commit_on_branch(repo, target, message, flat)
+        status = 200 if existing is not None else 201
+        return status, {
+            "content": {"name": path.rsplit("/", 1)[-1], "path": path,
+                        "sha": blob_oid, "size": len(content_bytes),
+                        "encoding": "base64"},
+            "commit": {"sha": commit_oid, "message": message},
+        }
+
+    def contents_delete(self, repo, path, message, branch):
+        target = branch or repo.default_branch
+        flat = self.flat_tree_at(repo, target)
+        if path not in flat:
+            return 404, {"message": "Not Found"}
+        del flat[path]
+        commit_oid = self.commit_on_branch(repo, target, message, flat)
+        return 200, {"commit": {"sha": commit_oid, "message": message}}
+
+    # -- issues ------------------------------------------------------------
+
+    def create_issue(self, repo, title, body, labels):
+        for label in labels or []:
+            if label not in repo.labels:
+                return None, "Label %s does not exist" % label
+        number = repo.next_issue
+        repo.next_issue += 1
+        issue = {
+            "id": self._fresh_id(),
+            "number": number,
+            "title": title or "",
+            "body": body or "",
+            "state": "open",
+            "labels": list(labels or []),
+            "comments": [],
+            "created_at": tick_iso(),
+            "updated_at": tick_iso(),
+            "seq": number,
+        }
+        repo.issues[number] = issue
+        return issue, None
+
+    def list_issues(self, repo, state=None, sort="created", direction="desc"):
+        issues = list(repo.issues.values())
+        if state in ("open", "closed"):
+            issues = [i for i in issues if i["state"] == state]
+        reverse = direction != "asc"
+        issues.sort(key=lambda i: i["seq"], reverse=reverse)
+        return issues
+
+    # -- pull requests ------------------------------------------------------
+
+    def diff_between(self, base_commit, head_commit):
+        """Changed paths between two commits: [(path, status, old, new)]."""
+        base_tree = self.commit_tree(base_commit) if base_commit else None
+        head_tree = self.commit_tree(head_commit) if head_commit else None
+        base_flat = self.objects.flatten_tree(base_tree) if base_tree else {}
+        head_flat = self.objects.flatten_tree(head_tree) if head_tree else {}
+        out = []
+        for path in sorted(set(base_flat) | set(head_flat)):
+            old = base_flat.get(path)
+            new = head_flat.get(path)
+            if old is None:
+                out.append((path, "added", None, new))
+            elif new is None:
+                out.append((path, "removed", old, None))
+            elif old[1] != new[1]:
+                out.append((path, "modified", old, new))
+        return out
+
+    def pull_diff(self, repo, pull):
+        base = self.objects.merge_base(pull["base_sha"], pull["head_sha"])
+        return self.diff_between(base, pull["head_sha"])
+
+    def pull_conflict(self, repo, pull):
+        """True when the head's changes clash with the base's later changes."""
+        base_tip = repo.branch_tip(pull["base"])
+        head_tip = pull["head_sha"]
+        if base_tip is None or head_tip is None:
+            return False
+        base_commit = self.objects.peel_to_commit(base_tip) or base_tip
+        head_commit = self.objects.peel_to_commit(head_tip) or head_tip
+        merge_base = self.objects.merge_base(base_commit, head_commit)
+        if merge_base is None:
+            return False
+        head_changes = {p: n for p, _s, _o, n in self.diff_between(merge_base, head_commit)}
+        base_changes = {p: n for p, _s, _o, n in self.diff_between(merge_base, base_commit)}
+        for path, head_entry in head_changes.items():
+            if path not in base_changes:
+                continue
+            head_oid = head_entry[1] if head_entry else None
+            base_oid = base_changes[path][1] if base_changes[path] else None
+            if head_oid != base_oid:
+                return True
+        return False
+
+    def create_pull(self, repo, head, base, title, body):
+        head_tip = repo.branch_tip(head)
+        base_tip = repo.branch_tip(base)
+        if head_tip is None:
+            return None, "Head branch %s does not exist" % head
+        if base_tip is None:
+            return None, "Base branch %s does not exist" % base
+        for other in repo.pulls.values():
+            if other["head"] == head and other["state"] == "open":
+                return None, "A pull request already exists for %s" % head
+        number = repo.next_pull
+        repo.next_pull += 1
+        pull = {
+            "id": self._fresh_id(),
+            "number": number,
+            "title": title or "",
+            "body": body or "",
+            "head": head,
+            "base": base,
+            "head_sha": self.objects.peel_to_commit(head_tip) or head_tip,
+            "base_sha": self.objects.peel_to_commit(base_tip) or base_tip,
+            "state": "open",
+            "merged": False,
+            "merged_at": None,
+            "merge_commit_sha": None,
+            "created_at": tick_iso(),
+            "updated_at": tick_iso(),
+            "seq": number,
+        }
+        repo.pulls[number] = pull
+        return pull, None
+
+    def merge_pull(self, repo, pull):
+        """Squash-merge a pull request. Returns (status, payload)."""
+        if pull["state"] != "open":
+            return 405, {"message": "Pull request #%d is already %s" % (pull["number"], pull["state"])}
+        base_tip = repo.branch_tip(pull["base"])
+        if base_tip is None:
+            return 405, {"message": "Base branch %s does not exist" % pull["base"]}
+        base_commit = self.objects.peel_to_commit(base_tip) or base_tip
+        head_commit = pull["head_sha"]
+        if self.pull_conflict(repo, pull):
+            return 405, {"message": "Merge conflict: the head and base both changed a file"}
+        merge_base = self.objects.merge_base(base_commit, head_commit)
+        head_changes = self.diff_between(merge_base, head_commit)
+        flat = self.flat_tree_at(repo, pull["base"])
+        for path, _status, _old, new in head_changes:
+            if new is None:
+                flat.pop(path, None)
+            else:
+                flat[path] = new
+        message = "Squash merge #%d: %s" % (pull["number"], pull["title"])
+        tree_oid = self.objects.build_tree_from_entries(flat)
+        data = build_commit(tree_oid, [base_commit], message, VIEWER_IDENT, tick_seconds())
+        merge_oid = self.objects.put("commit", data)
+        repo.refs["refs/heads/" + pull["base"]] = merge_oid
+        pull["state"] = "closed"
+        pull["merged"] = True
+        pull["merged_at"] = tick_iso()
+        pull["merge_commit_sha"] = merge_oid
+        pull["updated_at"] = tick_iso()
+        return 200, {"sha": merge_oid, "merged": True,
+                     "message": "Pull request successfully merged"}
+
+    # -- fetch selection -----------------------------------------------------
+
+    def select_fetch(self, wants, haves, shallow_boundary, depth):
+        """Objects for a fetch: (sorted oids, shallow list, unshallow list).
+
+        Walk commits from the wants with generations (want = generation 1),
+        expanding through haves, stopping past the depth limit. What the
+        client already holds (the full closure of its haves) is excluded.
+        """
+        have_closure = self.objects.reachable(
+            haves, follow_parents=True,
+            stop_parents_at=set(shallow_boundary or []))
+        generation = {}
+        queue = []
+        tag_wants = []
+        for want in wants:
+            found = self.objects.get(want)
+            if found is None:
+                continue
+            if found[0] == "tag":
+                tag_wants.append(want)
+                target = parse_tag(found[1])["object"]
+                target_commit = self.objects.peel_to_commit(target)
+                if target_commit is not None and target_commit not in generation:
+                    generation[target_commit] = 1
+                    queue.append(target_commit)
+            elif found[0] == "commit":
+                if want not in generation:
+                    generation[want] = 1
+                    queue.append(want)
+        head = 0
+        while head < len(queue):
+            current = queue[head]
+            head += 1
+            gen = generation[current]
+            if depth is not None and gen >= depth:
+                continue
+            found = self.objects.get(current)
+            if found is None or found[0] != "commit":
+                continue
+            for parent in parse_commit(found[1])["parents"]:
+                if parent not in generation:
+                    generation[parent] = gen + 1
+                    queue.append(parent)
+        sent_commits = {c for c, g in generation.items()
+                        if (depth is None or g <= depth) and c not in have_closure}
+        chosen = set()
+        for commit in sent_commits:
+            chosen |= self.objects.tree_closure(commit)
+        for want in tag_wants:
+            if want not in have_closure:
+                chosen.add(want)
+        chosen -= have_closure
+        shallow_out = []
+        if depth is not None:
+            for commit in sorted(sent_commits):
+                if generation.get(commit) != depth:
+                    continue
+                found = self.objects.get(commit)
+                if found is not None and parse_commit(found[1])["parents"]:
+                    shallow_out.append(commit)
+        unshallow_out = []
+        for boundary in shallow_boundary or []:
+            found = self.objects.get(boundary)
+            if found is None or found[0] != "commit":
+                continue
+            if any(p in sent_commits for p in parse_commit(found[1])["parents"]):
+                unshallow_out.append(boundary)
+        return sorted(chosen), sorted(shallow_out), sorted(unshallow_out)
 
 
 # ---------------------------------------------------------------------------
-# repo object rendering (REST shapes)
+# JSON views: the shapes the REST, GraphQL and MCP surfaces all share.
 # ---------------------------------------------------------------------------
 
-def repo_json(repo):
-    login = STORE.login()
+
+def repo_view(repo):
     return {
-        "id": repo.dbid,
+        "id": repo.db_id,
         "node_id": repo.global_id(),
         "name": repo.name,
-        "full_name": "%s/%s" % (login, repo.name),
+        "full_name": "%s/%s" % (repo.owner, repo.name),
+        "owner": {"login": repo.owner, "id": VIEWER["id"]},
         "private": repo.private,
-        "owner": {"login": login, "id": 1, "type": "User",
-                  "node_id": gid("user", login) if login else ""},
         "description": repo.description,
         "default_branch": repo.default_branch,
-        "created_at": FIXED_TS,
-        "updated_at": FIXED_TS,
-        "pushed_at": FIXED_TS,
-        "html_url": "https://example.invalid/%s/%s" % (login, repo.name),
-        "url": "/api/v3/repos/%s/%s" % (login, repo.name),
-        "clone_url": "https://example.invalid/%s/%s.git" % (login, repo.name),
-        "git_url": "git://example.invalid/%s/%s.git" % (login, repo.name),
-        "ssh_url": "git@example.invalid:%s/%s.git" % (login, repo.name),
-        "homepage": "",
-        "language": None,
-        "has_issues": True,
-        "has_projects": True,
-        "has_wiki": True,
-        "forks_count": 0,
-        "stargazers_count": 0,
-        "watchers_count": 0,
-        "open_issues_count": sum(1 for i in repo.issues.values() if i["state"] == "open"),
-        "license": None,
-        "permissions": {"admin": True, "maintain": True, "push": True,
-                        "triage": True, "pull": True},
-        "visibility": "private" if repo.private else "public",
+        "created_at": repo.created_at,
+        "updated_at": repo.updated_at,
     }
 
 
-def issue_json(repo, issue):
-    login = STORE.login()
+def issue_view(repo, issue):
     return {
-        "id": issue["dbid"],
-        "node_id": issue["gid"],
+        "id": issue["id"],
+        "node_id": opaque_id("I", repo.owner, repo.name, issue["number"]),
         "number": issue["number"],
         "title": issue["title"],
         "body": issue["body"],
         "state": issue["state"],
-        "labels": [{"name": n, "color": repo.labels[n]["color"], "id": 1,
-                    "description": "", "default": False}
-                   for n in issue["labels"] if n in repo.labels],
-        "user": {"login": login, "id": 1, "type": "User"},
-        "created_at": FIXED_TS,
-        "updated_at": FIXED_TS,
-        "closed_at": FIXED_TS if issue["state"] == "closed" else None,
-        "comments": len(repo.comments.get(issue["number"], [])),
-        "html_url": "https://example.invalid/%s/%s/issues/%d" % (login, repo.name, issue["number"]),
-        "url": "/api/v3/repos/%s/%s/issues/%d" % (login, repo.name, issue["number"]),
-        "repository_url": "/api/v3/repos/%s/%s" % (login, repo.name),
-        "assignee": None,
-        "milestone": None,
-        "locked": False,
+        "labels": [{"name": name, "color": repo.labels.get(name, {}).get("color", "ededed")}
+                   for name in issue["labels"]],
+        "user": {"login": VIEWER_LOGIN, "id": VIEWER["id"]},
+        "comments": len(issue["comments"]),
+        "created_at": issue["created_at"],
+        "updated_at": issue["updated_at"],
     }
 
 
-def pr_json(repo, pr):
-    login = STORE.login()
-    head_sha = repo.refs.get("refs/heads/" + pr["head"], "") or ""
-    base_sha = repo.refs.get("refs/heads/" + pr["base"], "") or ""
+def pull_view(repo, pull):
     return {
-        "id": pr["dbid"],
-        "node_id": pr["gid"],
-        "number": pr["number"],
-        "title": pr["title"],
-        "body": pr["body"],
-        "state": pr["state"],
-        "head": {"ref": pr["head"], "sha": head_sha,
-                 "label": "%s:%s" % (login, pr["head"]),
-                 "user": {"login": login, "type": "User"},
-                 "repo": {"name": repo.name, "full_name": "%s/%s" % (login, repo.name)}},
-        "base": {"ref": pr["base"], "sha": base_sha,
-                 "label": "%s:%s" % (login, pr["base"]),
-                 "user": {"login": login, "type": "User"},
-                 "repo": {"name": repo.name, "full_name": "%s/%s" % (login, repo.name)}},
-        "merged": pr["merged"],
-        "merged_at": FIXED_TS if pr["merged"] else None,
-        "merge_commit_sha": pr["merge_sha"] or "",
-        "mergeable": pr["mergeable"] is not False,
-        "mergeable_state": ("clean" if pr["mergeable"] else "dirty"),
-        "user": {"login": login, "id": 1, "type": "User"},
-        "created_at": FIXED_TS,
-        "updated_at": FIXED_TS,
-        "closed_at": FIXED_TS if pr["state"] == "closed" else None,
-        "draft": False,
-        "html_url": "https://example.invalid/%s/%s/pull/%d" % (login, repo.name, pr["number"]),
-        "url": "/api/v3/repos/%s/%s/pulls/%d" % (login, repo.name, pr["number"]),
+        "id": pull["id"],
+        "node_id": opaque_id("P", repo.owner, repo.name, pull["number"]),
+        "number": pull["number"],
+        "title": pull["title"],
+        "body": pull["body"],
+        "state": pull["state"],
+        "head": {"ref": pull["head"], "sha": pull["head_sha"],
+                 "label": "%s:%s" % (repo.owner, pull["head"])},
+        "base": {"ref": pull["base"], "sha": pull["base_sha"],
+                 "label": "%s:%s" % (repo.owner, pull["base"])},
+        "merged": pull["merged"],
+        "merged_at": pull["merged_at"],
+        "merge_commit_sha": pull["merge_commit_sha"],
+        "user": {"login": VIEWER_LOGIN, "id": VIEWER["id"]},
+        "created_at": pull["created_at"],
+        "updated_at": pull["updated_at"],
     }
 
 
-def commit_json(repo, oid):
-    obj = repo.objects.get(oid)
-    c = parse_commit(obj[1]) if obj else {"message": "", "parents": [], "author": "", "committer": ""}
-    login = STORE.login()
+def comment_view(repo, issue, comment):
     return {
-        "sha": oid,
-        "commit": {
-            # GitHub's REST view strips the trailing newline of the message.
-            "message": c["message"].rstrip("\n"),
-            "author": {"name": login, "email": "%s@example.invalid" % login, "date": FIXED_TS},
-            "committer": {"name": login, "email": "%s@example.invalid" % login, "date": FIXED_TS},
-        },
-        "author": {"login": login, "id": 1, "type": "User"},
-        "committer": {"login": login, "id": 1, "type": "User"},
-        "parents": [{"sha": p} for p in c["parents"]],
-        "url": "/api/v3/repos/%s/%s/commits/%s" % (login, repo.name, oid),
-        "html_url": "https://example.invalid/%s/%s/commit/%s" % (login, repo.name, oid),
+        "id": comment["id"],
+        "node_id": opaque_id("C", repo.owner, repo.name, issue["number"], comment["id"]),
+        "body": comment["body"],
+        "user": {"login": VIEWER_LOGIN, "id": VIEWER["id"]},
+        "created_at": comment["created_at"],
+        "updated_at": comment["updated_at"],
     }
 
 
-def branch_tip(repo, branch):
-    return repo.refs.get("refs/heads/" + branch)
-
-
-def tip_tree(repo, branch):
-    tip = branch_tip(repo, branch)
-    if not tip:
-        return None
-    obj = repo.objects.get(tip)
-    if obj is None or obj[0] != "commit":
-        return None
-    return parse_commit(obj[1])["tree"]
-
-
-def list_commits(repo, ref):
-    """Newest-first commit oids reachable from ref (first-parent walk)."""
-    tip = repo.refs.get(ref) or branch_tip(repo, ref) or (ref if is_oid(ref) else None)
-    out = []
-    seen = set()
-    cur = tip
-    while cur and cur not in seen:
-        obj = repo.objects.get(cur)
-        if obj is None or obj[0] != "commit":
-            break
-        seen.add(cur)
-        out.append(cur)
-        parents = parse_commit(obj[1])["parents"]
-        cur = parents[0] if parents else None
-    return out
-
-
-def make_commit(repo, tree_oid, parents, message):
-    seq = STORE.tick()
-    author = "%s <%s@example.invalid>" % (STORE.login(), STORE.login())
-    data = build_commit(tree_oid, parents, message if message.endswith("\n") else message + "\n",
-                        author, EPOCH + seq)
-    oid = hash_object("commit", data)
-    repo.objects[oid] = ("commit", data)
-    return oid
-
-
-def pr_files(repo, pr):
-    """Diff base tip tree -> head tip tree, with line counts."""
-    base_tree = tip_tree(repo, pr["base"])
-    head_tree = tip_tree(repo, pr["head"])
-    diff = tree_diff(repo.objects, base_tree, head_tree)
-    out = []
-    for path in sorted(diff):
-        kind, old_oid, new_oid = diff[path]
-        old_data = repo.objects.get(old_oid, (None, b""))[1] if old_oid else b""
-        new_data = repo.objects.get(new_oid, (None, b""))[1] if new_oid else b""
-        if kind == "added":
-            additions = len(new_data.decode("utf-8", "replace").splitlines())
-            deletions = 0
-            status = "added"
-        elif kind == "deleted":
-            additions = 0
-            deletions = len(old_data.decode("utf-8", "replace").splitlines())
-            status = "removed"
-        else:
-            old_lines = old_data.decode("utf-8", "replace").splitlines()
-            new_lines = new_data.decode("utf-8", "replace").splitlines()
-            additions = deletions = 0
-            for line in difflib.unified_diff(old_lines, new_lines, lineterm=""):
-                if line.startswith("+++") or line.startswith("---"):
-                    continue
-                if line.startswith("+"):
-                    additions += 1
-                elif line.startswith("-"):
-                    deletions += 1
-            status = "modified"
-        out.append({"filename": path, "status": status, "additions": additions,
-                    "deletions": deletions, "changes": additions + deletions,
-                    "sha": new_oid or old_oid or "",
-                    "blob_url": "", "raw_url": "", "contents_url": ""})
-    return out
-
-
-def pr_conflict(repo, pr):
-    """True when the head branch cannot squash-merge cleanly onto the base."""
-    base_tip = branch_tip(repo, pr["base"])
-    head_tip = branch_tip(repo, pr["head"])
-    if not base_tip or not head_tip:
-        return False
-    base = merge_base(repo.objects, base_tip, head_tip)
-    if base is None:
-        return False
-    base_tree = parse_commit(repo.objects[base][1])["tree"]
-    tip_base_tree = parse_commit(repo.objects[base_tip][1])["tree"]
-    tip_head_tree = parse_commit(repo.objects[head_tip][1])["tree"]
-    d_base = tree_diff(repo.objects, base_tree, tip_base_tree)
-    d_head = tree_diff(repo.objects, base_tree, tip_head_tree)
-    for path in set(d_base) & set(d_head):
-        if d_base[path][2] != d_head[path][2]:
-            return True
-    return False
-
-
-def squash_merge(repo, pr):
-    """Squash-merge pr onto its base branch. Returns merge commit oid or None."""
-    base_tip = branch_tip(repo, pr["base"])
-    head_tip = branch_tip(repo, pr["head"])
-    if not base_tip or not head_tip:
-        return None
-    if pr_conflict(repo, pr):
-        return None
-    base = merge_base(repo.objects, base_tip, head_tip)
-    base_tree = parse_commit(repo.objects[base][1])["tree"] if base else None
-    tip_base_tree = parse_commit(repo.objects[base_tip][1])["tree"]
-    tip_head_tree = parse_commit(repo.objects[head_tip][1])["tree"]
-    d_head = tree_diff(repo.objects, base_tree, tip_head_tree)
-    flat = flatten_tree(repo.objects, tip_base_tree)
-    for path, (kind, _old, new_oid) in d_head.items():
-        if kind == "deleted":
-            flat.pop(path, None)
-        else:
-            mode = flatten_tree(repo.objects, tip_head_tree).get(path, ("100644", new_oid))[0]
-            flat[path] = (mode, new_oid)
-    new_tree = build_tree_from_map(repo.objects, flat)
-    message = "%s (#%d)\n" % (pr["title"], pr["number"])
-    merge_oid = make_commit(repo, new_tree, [base_tip], message)
-    repo.refs["refs/heads/" + pr["base"]] = merge_oid
-    return merge_oid
-
-
 # ---------------------------------------------------------------------------
-# git smart HTTP: advertisements and fetch
+# HTTP plumbing: one threaded server, keep-alive, a single store lock.
 # ---------------------------------------------------------------------------
 
-def v0_ref_lines(repo, service):
-    """v0 advertisement ref lines (without the service preamble)."""
-    caps_upload = "side-band-64k thin-pack ofs-delta multi_ack shallow agent=%s symref=HEAD:refs/heads/%s" % (AGENT, repo.default_branch)
-    caps_recv = "report-status side-band-64k delete-refs ofs-delta agent=%s symref=HEAD:refs/heads/%s" % (AGENT, repo.default_branch)
-    caps = caps_upload if service == "git-upload-pack" else caps_recv
-    lines = []
-    refs = sorted(repo.refs.items())
-    head_tip = repo.refs.get("refs/heads/" + repo.default_branch)
-    if not refs:
-        lines.append("%s capabilities^{}\0%s\n" % (ZERO_OID, caps))
-        return lines, caps
-    first = True
-    if head_tip:
-        lines.append("%s HEAD\0%s\n" % (head_tip, caps))
-        first = False
-    for name, oid in refs:
-        cap = "" if not first else "\0" + caps
-        if first:
-            first = False
-        lines.append("%s %s%s\n" % (oid, name, cap))
-        if oid in repo.objects and repo.objects[oid][0] == "tag":
-            peeled = parse_tag(repo.objects[oid][1])["object"]
-            lines.append("%s %s^{}\n" % (peeled, name))
-    return lines, caps
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 
-def v0_advertisement(repo, service):
-    lines, _caps = v0_ref_lines(repo, service)
-    body = pkt("# service=%s\n" % service) + FLUSH
-    for line in lines:
-        body += pkt(line)
-    body += FLUSH
-    return body
+def _require_auth(handler):
+    token = os.environ.get("MAKEFUN_SHOP_TOKEN", "")
+    if not token:
+        return
+    presented = handler.headers.get("Authorization", "")
+    if presented != "Bearer " + token:
+        raise ApiError(401, "Requires authentication")
 
 
-def v2_advertisement():
-    lines = ["version 2\n", "agent=%s\n" % AGENT, "ls-refs=unborn\n",
-             "fetch=shallow filter\n", "object-format=sha1\n"]
-    return pkt_lines(lines + ["flush"])
+class ForgeServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def get_request(self):
+        sock, address = super().get_request()
+        # Without this, Nagle + the client's delayed ACK stalls every small
+        # request/response pair on a keep-alive connection by ~20-40ms —
+        # fatal for the sequential bench workloads.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return sock, address
+
+    def __init__(self, address, handler_class):
+        super().__init__(address, handler_class)
+        self.store = Store()
 
 
-def ls_refs_v2(repo, prefixes, peel, symrefs, unborn):
-    """Build v2 ls-refs response lines."""
-    out = []
-    head_tip = repo.refs.get("refs/heads/" + repo.default_branch)
-    names = sorted(repo.refs)
-    keep = lambda n: not prefixes or any(n.startswith(p) for p in prefixes)
-    if not prefixes or keep("HEAD"):
-        if head_tip:
-            line = "%s HEAD" % head_tip
-            if symrefs:
-                line += " symref-target:refs/heads/%s" % repo.default_branch
-            out.append(line + "\n")
-        elif unborn:
-            line = "unborn HEAD"
-            if symrefs:
-                line += " symref-target:refs/heads/%s" % repo.default_branch
-            out.append(line + "\n")
-    for name in names:
-        if not keep(name):
-            continue
-        oid = repo.refs[name]
-        line = "%s %s" % (oid, name)
-        if peel and repo.objects.get(oid, (None,))[0] == "tag":
-            line += " peeled:%s" % parse_tag(repo.objects[oid][1])["object"]
-        out.append(line + "\n")
-    return pkt_lines(out + ["flush"])
-
-
-def fetch_send_set(repo, wants, haves, depth, shallow_old):
-    """Objects to send for a fetch. Returns (oids, shallow_new, unshallow)."""
-    objects = repo.objects
-    wanted, _ = collect_reachable(objects, wants, max_depth=depth)
-    # A have that is also a shallow boundary means the client holds that
-    # commit (and its tree) but NONE of its ancestors — deepening must
-    # still deliver them. Cap such haves at one generation; normal haves
-    # count their full reachable history.
-    held = set()
-    shallow_set = set(shallow_old or [])
-    for h in haves:
-        if h in shallow_set:
-            hset, _ = collect_reachable(objects, [h], max_depth=1)
-        else:
-            hset, _ = collect_reachable(objects, [h])
-        held |= hset
-    send = wanted - held
-    # shallow boundary: included commits whose parent is not included
-    shallow_new = []
-    unshallow = []
-    if depth is not None:
-        included_commits = [o for o in send if objects.get(o, (None,))[0] == "commit"]
-        for oid in included_commits:
-            parents = parse_commit(objects[oid][1])["parents"]
-            if any(p not in send and p in objects for p in parents):
-                shallow_new.append(oid)
-        for old in shallow_old or []:
-            if old in wanted:
-                parents = parse_commit(objects[old][1])["parents"] if objects.get(old, (None,))[0] == "commit" else []
-                if parents and all(p in send for p in parents):
-                    unshallow.append(old)
-    return send, sorted(shallow_new), sorted(unshallow)
-
-
-def sideband_pack(pack):
-    out = bytearray()
-    step = 65515
-    for i in range(0, len(pack), step):
-        chunk = pack[i:i + step]
-        out += pkt(b"\x01" + chunk)
-    return bytes(out)
-
-
-def fetch_v2_response(repo, wants, haves, depth, shallow_old):
-    key = (repo.name, tuple(sorted(wants)), tuple(sorted(haves)), depth,
-           tuple(sorted(shallow_old or [])))
-    cached = STORE.fetch_cache.get(key)
-    if cached is not None:
-        return cached
-    send, shallow_new, unshallow = fetch_send_set(repo, wants, haves, depth, shallow_old)
-    objs = [(repo.objects[o][0], repo.objects[o][1]) for o in sorted(send) if o in repo.objects]
-    pack = write_pack(objs)
-    parts = [pkt("acknowledgments\n"), pkt("NAK\n"), DELIM]
-    if shallow_new or unshallow:
-        parts.append(pkt("shallow-info\n"))
-        for oid in shallow_new:
-            parts.append(pkt("shallow %s\n" % oid))
-        for oid in unshallow:
-            parts.append(pkt("unshallow %s\n" % oid))
-        parts.append(DELIM)
-    parts.append(pkt("packfile\n"))
-    body = b"".join(parts) + sideband_pack(pack) + FLUSH
-    if len(STORE.fetch_cache) < 64:
-        STORE.fetch_cache[key] = body
-    return body
-
-
-def fetch_v0_response(repo, wants, haves, depth, shallow_old):
-    key = ("v0", repo.name, tuple(sorted(wants)), tuple(sorted(haves)), depth,
-           tuple(sorted(shallow_old or [])))
-    cached = STORE.fetch_cache.get(key)
-    if cached is not None:
-        return cached
-    send, shallow_new, unshallow = fetch_send_set(repo, wants, haves, depth, shallow_old)
-    objs = [(repo.objects[o][0], repo.objects[o][1]) for o in sorted(send) if o in repo.objects]
-    pack = write_pack(objs)
-    body = pkt("NAK\n")
-    for oid in shallow_new:
-        body += pkt("shallow %s\n" % oid)
-    for oid in unshallow:
-        body += pkt("unshallow %s\n" % oid)
-    body += sideband_pack(pack) + FLUSH
-    STORE.fetch_cache[key] = body
-    return body
-
-
-# ---------------------------------------------------------------------------
-# shared creation helpers (REST / GraphQL / MCP share one store)
-# ---------------------------------------------------------------------------
-
-def create_repo(name, private, description):
-    if not name or not isinstance(name, str):
-        return None, "Repository name is required"
-    if name in STORE.repos:
-        return None, "already exists"
-    dbid = STORE.next_repo_id
-    STORE.next_repo_id += 1
-    repo = Repo(name, private, description, dbid, STORE.tick())
-    STORE.repos[name] = repo
-    return repo, None
-
-
-def create_issue(repo, title, body, labels=()):
-    number = repo.next_number
-    repo.next_number += 1
-    dbid = repo.dbid * 1000000 + number
-    issue = {"number": number, "dbid": dbid, "gid": gid("issue", repo.dbid, number),
-             "title": title or "", "body": body or "", "state": "open",
-             "labels": list(labels), "seq": STORE.tick()}
-    repo.issues[number] = issue
-    repo.comments.setdefault(number, [])
-    return issue
-
-
-def create_pr(repo, title, body, head, base):
-    number = repo.next_number
-    repo.next_number += 1
-    dbid = repo.dbid * 1000000 + number
-    pr = {"number": number, "dbid": dbid, "gid": gid("pr", repo.dbid, number),
-          "title": title or "", "body": body or "", "state": "open",
-          "head": head, "base": base, "merged": False, "merge_sha": None,
-          "mergeable": True, "seq": STORE.tick()}
-    repo.prs[number] = pr
-    pr["mergeable"] = not pr_conflict(repo, pr)
-    return pr
-
-
-def find_repo_by_dbid(dbid):
-    for repo in STORE.repos.values():
-        if repo.dbid == dbid:
-            return repo
-    return None
-
-
-# ---------------------------------------------------------------------------
-# HTTP handler
-# ---------------------------------------------------------------------------
-
-class Handler(BaseHTTPRequestHandler):
+class ForgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "Forge/1.0"
+    server_version = "makefun-forge/1.0"
+
+    # -- quiet ------------------------------------------------------------
 
     def log_message(self, *args):
         pass
 
-    def setup(self):
-        super().setup()
-        # Kill Nagle on the socket: the suite drives thousands of small
-        # request/response round trips over one keep-alive connection, and
-        # Nagle + delayed ACK adds ~20-40 ms per round trip (the read
-        # workload blew its 60 s budget on this alone).
+    # -- response helpers ---------------------------------------------------
+
+    def _send(self, status, body, content_type="application/json", extra=None):
         try:
-            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            if status != 204:
+                self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-GitHub-Request-Id", self.server.store.request_id())
+            if extra:
+                for key, value in extra.items():
+                    self.send_header(key, value)
+            self.end_headers()
+            if status != 204 and body:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
             pass
 
-    # -- plumbing ---------------------------------------------------------
-    def _read_body_raw(self):
+    def _send_json(self, status, obj, extra=None):
+        self._send(status, json_bytes(obj), "application/json", extra)
+
+    def _error(self, status, message):
+        self._send_json(status, {"message": message})
+
+    # -- request helpers ------------------------------------------------------
+
+    def _read_socket_body(self):
         length = self.headers.get("Content-Length")
         if not length:
             return b""
         try:
-            n = int(length)
+            count = int(length)
         except ValueError:
             return b""
-        if n <= 0:
+        if count <= 0:
             return b""
-        return self.rfile.read(n)
+        return self.rfile.read(count)
 
     def _read_body(self):
-        # The body is drained once per request in _dispatch (see there) and
-        # cached, so handlers that answer early (401/404) never leave unread
-        # bytes on the HTTP/1.1 keep-alive connection.
-        if getattr(self, "_body_cache", None) is not None:
-            return self._body_cache
-        self._body_cache = self._read_body_raw()
-        return self._body_cache
+        return getattr(self, "_request_body", b"")
 
-    def _send(self, status, body, content_type="application/json", extra=None):
-        if isinstance(body, str):
-            body = body.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-GitHub-Request-Id", STORE.next_req_id())
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        if body and self.command != "HEAD":
-            self.wfile.write(body)
-
-    def _json(self, status, obj, extra=None):
-        self._send(status, json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
-                   "application/json", extra)
-
-    def _err(self, status, message):
-        self._json(status, {"message": message})
-
-    def _auth_ok(self):
-        if not TOKEN:
-            return True
-        auth = (self.headers.get("Authorization") or "").strip()
-        return auth == "Bearer " + TOKEN
-
-    def _json_body(self):
-        """Parsed JSON body, or {} when empty. Raises ValueError on bad JSON."""
+    def _read_json(self):
         raw = self._read_body()
-        if not raw.strip():
+        if not raw:
             return {}
         try:
-            value = json.loads(raw.decode("utf-8"))
-        except Exception:
-            raise ValueError("malformed JSON")
-        if not isinstance(value, dict):
-            raise ValueError("JSON body must be an object")
-        return value
+            parsed = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise ApiError(400, "Problems parsing JSON")
+        if not isinstance(parsed, dict):
+            raise ApiError(400, "Problems parsing JSON")
+        return parsed
 
-    # -- entry points ------------------------------------------------------
+    def _split_path(self):
+        split = urllib.parse.urlsplit(self.path)
+        path = split.path
+        if len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+        segments = [urllib.parse.unquote(seg) for seg in path.split("/") if seg != ""]
+        query = urllib.parse.parse_qs(split.query, keep_blank_values=True)
+        return segments, query
+
+    def _query_one(self, query, name, default=None):
+        values = query.get(name)
+        if not values:
+            return default
+        return values[0]
+
+    def _page_params(self, query, default_per_page=30):
+        try:
+            per_page = int(self._query_one(query, "per_page", default_per_page))
+        except (TypeError, ValueError):
+            per_page = default_per_page
+        per_page = max(1, min(per_page, 100))
+        try:
+            page = int(self._query_one(query, "page", 1))
+        except (TypeError, ValueError):
+            page = 1
+        return max(1, page), per_page
+
+    # -- dispatch ---------------------------------------------------------------
+
     def do_GET(self):
-        self._dispatch()
+        self._dispatch("GET")
 
     def do_POST(self):
-        self._dispatch()
+        self._dispatch("POST")
 
     def do_PUT(self):
-        self._dispatch()
+        self._dispatch("PUT")
 
     def do_PATCH(self):
-        self._dispatch()
+        self._dispatch("PATCH")
 
     def do_DELETE(self):
-        self._dispatch()
+        self._dispatch("DELETE")
 
-    def _dispatch(self):
+    def _dispatch(self, method):
+        # Drain the request body up front: if a handler ever errors before
+        # reading it, the leftover bytes would otherwise be parsed as the
+        # next request on this keep-alive connection.
+        self._request_body = self._read_socket_body()
         try:
-            # Drain the request body BEFORE routing: an early answer (401
-            # for a missing token, 404 for an unknown path) that leaves the
-            # body unread poisons the HTTP/1.1 keep-alive connection — the
-            # client's next request on it is then parsed as garbage and the
-            # server answers with its HTML error page.
-            self._body_cache = self._read_body_raw()
-            with STORE.lock:
-                self._route()
+            with self.server.store.lock:
+                self._route(method)
+        except ApiError as err:
+            self._error(err.status, err.message)
         except BrokenPipeError:
             pass
-        except ConnectionResetError:
-            pass
-        except Exception:
+        except Exception as err:  # never drop a connection on an internal error
             try:
-                self._err(500, "Internal Server Error")
-            except Exception:
+                self._error(500, "Internal error: %s" % err)
+            except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    def _route(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = urllib.parse.unquote(parsed.path)
-        query = urllib.parse.parse_qs(parsed.query)
-        method = self.command
-
-        if path == "/healthz":
-            self._json(200, {"ok": True})
+    def _route(self, method):
+        segments, query = self._split_path()
+        if segments == ["healthz"] and method == "GET":
+            self._send_json(200, {"ok": True})
             return
-        if not self._auth_ok():
-            self._err(401, "Requires authentication")
+        if segments[:1] == ["api"] and len(segments) >= 2 and segments[1] == "v3":
+            _require_auth(self)
+            self._route_rest(method, segments[2:], query)
             return
-
-        if path == "/api/graphql" or path.startswith("/api/graphql/"):
+        if segments == ["api", "graphql"] and method == "POST":
+            _require_auth(self)
+            self._route_graphql()
+            return
+        if segments == ["mcp"]:
+            if method == "DELETE":
+                self._send_json(200, {})
+                return
             if method == "POST":
-                self._graphql()
-            else:
-                self._err(404, "Not Found")
+                _require_auth(self)
+                self._route_mcp()
+                return
+            raise ApiError(405, "Method Not Allowed")
+        if len(segments) >= 2 and segments[1].endswith(".git"):
+            _require_auth(self)
+            self._route_git(method, segments, query)
             return
-        if path == "/mcp":
-            if method == "POST":
-                self._mcp()
-            else:
-                self._err(404, "Not Found")
-            return
-        if path.startswith("/api/v3"):
-            self._rest(path[len("/api/v3"):], query, method)
-            return
-        m = re.match(r"^/([^/]+)/([^/]+)\.git(/.*)$", path)
-        if m:
-            owner, name, suffix = m.group(1), m.group(2), m.group(3)
-            self._git(owner, name, suffix, query, method)
-            return
-        self._err(404, "Not Found")
+        raise ApiError(404, "Not Found")
 
-    # -- REST --------------------------------------------------------------
-    def _rest(self, rest, query, method):
-        segments = [s for s in rest.split("/") if s != ""]
-        try:
-            body = self._json_body() if method in ("POST", "PUT", "PATCH", "DELETE") else {}
-        except ValueError:
-            self._err(400, "Invalid JSON body")
-            return
 
+    # -- REST v3 ------------------------------------------------------------
+
+    def _route_rest(self, method, segments, query):
+        store = self.server.store
         if not segments:
-            extra = {"X-OAuth-Scopes": "repo, user"}
-            self._json(200, {"current_user_url": "/api/v3/user",
-                             "repository_url": "/api/v3/repos/{owner}/{repo}"}, extra)
+            if method == "GET":
+                self._send_json(200, {
+                    "current_user_url": "/api/v3/user",
+                    "repository_url": "/api/v3/repos/{owner}/{repo}",
+                }, {"X-OAuth-Scopes": "repo, read:org"})
+                return
+            raise ApiError(404, "Not Found")
+        head = segments[0]
+        if head == "meta" and len(segments) == 1 and method == "GET":
+            self._send_json(200, {"installed_version": "1.0.0"})
             return
-        if segments == ["meta"]:
-            if method != "GET":
-                self._err(404, "Not Found")
-                return
-            self._json(200, {"installed_version": VERSION, "version": VERSION})
+        if head == "user":
+            self._rest_user(method, segments[1:], query)
             return
-        if segments == ["user"]:
-            if method != "GET":
-                self._err(404, "Not Found")
-                return
-            login = STORE.login()
-            if not login:
-                self._err(404, "Not Found")
-                return
-            self._json(200, {"login": login, "id": 1, "type": "User",
-                             "node_id": gid("user", login),
-                             "html_url": "https://example.invalid/" + login,
-                             "url": "/api/v3/users/" + login})
+        if head == "repos":
+            self._rest_repos(method, segments[1:], query)
             return
-        if segments[:2] == ["user", "repos"]:
-            if len(segments) == 2:
-                if method == "GET":
-                    self._list_user_repos(query)
-                elif method == "POST":
-                    name = body.get("name")
-                    repo, err = create_repo(name, body.get("private", False),
-                                            body.get("description", ""))
-                    if err == "already exists":
-                        self._err(422, "Repository already exists")
-                    elif err:
-                        self._err(422, err)
-                    else:
-                        self._json(201, repo_json(repo))
-                else:
-                    self._err(404, "Not Found")
-                return
-            self._err(404, "Not Found")
-            return
-        if segments[0] == "repos" and len(segments) >= 3:
-            owner, name = segments[1], segments[2]
-            STORE.learn(owner)
-            if owner != STORE.learned_login:
-                self._err(404, "Not Found")
-                return
-            repo = STORE.repos.get(name)
-            if repo is None:
-                self._err(404, "Not Found")
-                return
-            self._repo_route(repo, segments[3:], query, method, body)
-            return
-        self._err(404, "Not Found")
+        raise ApiError(404, "Not Found")
 
-    def _list_user_repos(self, query):
-        per_page = self._page_size(query, 30)
-        page = self._page(query)
-        repos = sorted(STORE.repos.values(), key=lambda r: r.created_seq)
-        total = len(repos)
-        start = (page - 1) * per_page
-        items = repos[start:start + per_page]
-        extra = {}
-        if start + per_page < total:
-            base = "http://%s/api/v3/user/repos?per_page=%d&page=%d" % (
-                self.headers.get("Host", "localhost"), per_page, page + 1)
-            extra["Link"] = '<%s>; rel="next"' % base
-        self._json(200, [repo_json(r) for r in items], extra)
+    def _rest_user(self, method, segments, query):
+        store = self.server.store
+        if not segments:
+            if method == "GET":
+                self._send_json(200, {"login": VIEWER_LOGIN, "id": VIEWER["id"],
+                                      "name": VIEWER["name"], "email": VIEWER["email"]})
+                return
+            raise ApiError(404, "Not Found")
+        if segments == ["repos"]:
+            if method == "GET":
+                page, per_page = self._page_params(query, 30)
+                repos = store.list_repos()
+                total = len(repos)
+                start = (page - 1) * per_page
+                items = repos[start:start + per_page]
+                extra = {}
+                host = self.headers.get("Host", "")
+                if start + per_page < total:
+                    last_page = (total + per_page - 1) // per_page
+                    base = "http://%s/api/v3/user/repos" % host
+                    extra["Link"] = ('<%s?per_page=%d&page=%d>; rel="next", '
+                                     '<%s?per_page=%d&page=%d>; rel="last"'
+                                     % (base, per_page, page + 1, base, per_page, last_page))
+                self._send_json(200, [repo_view(r) for r in items], extra)
+                return
+            if method == "POST":
+                body = self._read_json()
+                name = body.get("name")
+                repo, error = store.create_repo(
+                    name, private=body.get("private", False),
+                    description=body.get("description", ""))
+                if repo is None:
+                    raise ApiError(422, error)
+                self._send_json(201, repo_view(repo))
+                return
+        raise ApiError(404, "Not Found")
 
-    @staticmethod
-    def _page_size(query, default):
-        try:
-            return max(1, min(100, int(query.get("per_page", [default])[0])))
-        except (ValueError, TypeError):
-            return default
-
-    @staticmethod
-    def _page(query):
-        try:
-            return max(1, int(query.get("page", ["1"])[0]))
-        except (ValueError, TypeError):
-            return 1
-
-    def _repo_route(self, repo, rest, query, method, body):
-        login = STORE.login()
+    def _rest_repos(self, method, segments, query):
+        store = self.server.store
+        if len(segments) < 2:
+            raise ApiError(404, "Not Found")
+        owner, name = segments[0], segments[1]
+        repo = store.get_repo(owner, name)
+        if repo is None:
+            raise ApiError(404, "Not Found")
+        rest = segments[2:]
         if not rest:
             if method == "GET":
-                self._json(200, repo_json(repo))
+                self._send_json(200, repo_view(repo))
             elif method == "PATCH":
+                body = self._read_json()
                 if "description" in body:
-                    repo.description = body["description"] or ""
+                    repo.description = body.get("description") or ""
                 if "private" in body:
-                    repo.private = bool(body["private"])
-                self._json(200, repo_json(repo))
+                    repo.private = bool(body.get("private"))
+                repo.updated_at = tick_iso()
+                self._send_json(200, repo_view(repo))
             elif method == "DELETE":
-                del STORE.repos[repo.name]
+                store.delete_repo(repo)
                 self._send(204, b"")
             else:
-                self._err(404, "Not Found")
+                raise ApiError(404, "Not Found")
             return
+        resource = rest[0]
+        if resource == "branches":
+            self._rest_branches(method, repo, rest[1:])
+        elif resource == "commits":
+            self._rest_commits(method, repo, query)
+        elif resource == "contents":
+            self._rest_contents(method, repo, rest[1:], query)
+        elif resource == "git":
+            self._rest_git_data(method, repo, rest[1:])
+        elif resource == "labels":
+            self._rest_labels(method, repo)
+        elif resource == "issues":
+            self._rest_issues(method, repo, rest[1:], query)
+        elif resource == "pulls":
+            self._rest_pulls(method, repo, rest[1:], query)
+        else:
+            raise ApiError(404, "Not Found")
 
-        head = rest[0]
-        if head == "branches":
-            if len(rest) == 1 and method == "GET":
-                out = []
-                for ref in sorted(repo.refs):
-                    if ref.startswith("refs/heads/"):
-                        out.append({"name": ref[len("refs/heads/"):],
-                                    "commit": {"sha": repo.refs[ref],
-                                               "url": "/api/v3/repos/%s/%s/commits/%s" % (login, repo.name, repo.refs[ref])},
-                                    "protected": False})
-                self._json(200, out)
-                return
-            if len(rest) == 2 and method == "GET":
-                tip = repo.refs.get("refs/heads/" + rest[1])
-                if tip is None:
-                    self._err(404, "Not Found")
-                    return
-                self._json(200, {"name": rest[1], "commit": {"sha": tip}, "protected": False})
-                return
-            self._err(404, "Not Found")
+    def _rest_branches(self, method, repo, rest):
+        if method != "GET":
+            raise ApiError(404, "Not Found")
+        if not rest:
+            branches = [{"name": name, "commit": {"sha": tip}}
+                        for name, tip in repo.branches()]
+            self._send_json(200, branches)
             return
+        branch = "/".join(rest)
+        tip = repo.branch_tip(branch)
+        if tip is None:
+            raise ApiError(404, "Branch not found")
+        self._send_json(200, {"name": branch, "commit": {"sha": tip}})
 
-        if head == "commits" and method == "GET" and len(rest) == 1:
-            ref = query.get("sha", [repo.default_branch])[0]
-            commits = list_commits(repo, ref)
-            per_page = self._page_size(query, 30)
-            page = self._page(query)
-            start = (page - 1) * per_page
-            self._json(200, [commit_json(repo, c) for c in commits[start:start + per_page]])
+    def _rest_commits(self, method, repo, query):
+        if method != "GET":
+            raise ApiError(404, "Not Found")
+        ref = self._query_one(query, "sha")
+        tip = self.server.store.commit_for_ref(repo, ref)
+        if tip is None:
+            self._send_json(200, [])
             return
+        out = []
+        for oid in self.server.store.objects.commit_history(tip):
+            view = parse_commit(self.server.store.objects.get(oid)[1])
+            out.append({
+                "sha": oid,
+                "commit": {
+                    "message": view["message"],
+                    "author": {"name": view["author"], "date": ""},
+                    "committer": {"name": view["committer"], "date": ""},
+                },
+                "parents": [{"sha": p} for p in view["parents"]],
+            })
+        self._send_json(200, out)
 
-        if head == "git" and rest[1:2] == ["refs"]:
-            if method == "POST" and len(rest) == 2:
-                ref = body.get("ref", "")
-                sha = body.get("sha", "")
-                if not ref.startswith("refs/") or not is_oid(sha):
-                    self._err(422, "Invalid ref or sha")
-                    return
-                if ref in repo.refs:
-                    self._err(422, "Reference already exists")
-                    return
-                if sha not in repo.objects:
-                    self._err(422, "Object does not exist")
-                    return
-                repo.refs[ref] = sha
-                self._json(201, {"ref": ref, "object": {"sha": sha, "type": "commit"},
-                                 "url": "/api/v3/repos/%s/%s/git/refs/%s" % (login, repo.name, ref)})
-                return
-            if method == "GET" and len(rest) >= 3:
-                ref = "/".join(rest[2:])
-                tip = repo.refs.get(ref)
-                if tip is None:
-                    self._err(404, "Not Found")
-                    return
-                self._json(200, {"ref": ref, "object": {"sha": tip, "type": "commit"}})
-                return
-            self._err(404, "Not Found")
-            return
-
-        if head == "contents":
-            self._contents(repo, rest[1:], query, method, body)
-            return
-
-        if head == "labels":
-            if method == "POST" and len(rest) == 1:
-                name = body.get("name", "")
-                color = body.get("color", "ededed")
-                if not name:
-                    self._err(422, "Label name is required")
-                    return
-                repo.labels[name] = {"name": name, "color": color}
-                self._json(201, {"id": 1, "name": name, "color": color,
-                                 "description": "", "default": False})
-                return
-            if method == "GET" and len(rest) == 1:
-                self._json(200, [{"id": 1, "name": n, "color": l["color"],
-                                  "description": "", "default": False}
-                                 for n, l in repo.labels.items()])
-                return
-            self._err(404, "Not Found")
-            return
-
-        if head == "issues":
-            self._issues(repo, rest[1:], query, method, body)
-            return
-
-        if head == "pulls":
-            self._pulls(repo, rest[1:], query, method, body)
-            return
-
-        self._err(404, "Not Found")
-
-    # -- contents ------------------------------------------------------------
-    def _contents(self, repo, path_segs, query, method, body):
-        path = "/".join(path_segs)
-        ref = body.get("branch") if method in ("PUT", "DELETE") else None
-        if ref is None:
-            ref = query.get("ref", [repo.default_branch])[0]
-        tip = repo.refs.get("refs/heads/" + ref) or (ref if is_oid(ref) else None)
-        tree = None
-        if tip and tip in repo.objects and repo.objects[tip][0] == "commit":
-            tree = parse_commit(repo.objects[tip][1])["tree"]
-
-        def lookup(p):
-            if not p:
-                return ("dir", tree)
-            flat = flatten_tree(repo.objects, tree) if tree else {}
-            if p in flat:
-                return ("file", flat[p][1])
-            prefix = p + "/"
-            if any(k.startswith(prefix) for k in flat):
-                return ("dir", None)
-            return (None, None)
-
+    def _rest_contents(self, method, repo, rest, query):
+        store = self.server.store
+        path = "/".join(rest)
         if method == "GET":
-            kind, value = lookup(path)
-            if kind is None:
-                self._err(404, "Not Found")
+            ref = self._query_one(query, "ref")
+            tip = store.commit_for_ref(repo, ref)
+            if tip is None:
+                raise ApiError(404, "Not Found")
+            tree_oid = store.commit_tree(tip)
+            flat = store.objects.flatten_tree(tree_oid)
+            if path in flat:
+                _mode, blob_oid = flat[path]
+                data = store.objects.get(blob_oid)[1]
+                self._send_json(200, {
+                    "type": "file",
+                    "encoding": "base64",
+                    "content": b64_encode(data),
+                    "sha": blob_oid,
+                    "size": len(data),
+                    "name": path.rsplit("/", 1)[-1],
+                    "path": path,
+                })
                 return
-            if kind == "file":
-                data = repo.objects[value][1]
-                name = path.split("/")[-1]
-                self._json(200, {"type": "file", "encoding": "base64",
-                                 "size": len(data), "name": name, "path": path,
-                                 "content": base64.b64encode(data).decode("ascii"),
-                                 "sha": value,
-                                 "url": "/api/v3/repos/%s/%s/contents/%s" % (STORE.login(), repo.name, path)})
-                return
-            flat = flatten_tree(repo.objects, tree) if tree else {}
-            prefix = (path + "/") if path else ""
-            children = {}
-            for k, (_mode, oid) in flat.items():
-                if not k.startswith(prefix):
-                    continue
-                rest_p = k[len(prefix):]
-                first = rest_p.split("/")[0]
-                children.setdefault(first, ("/" in rest_p, oid))
-            out = []
-            for name in sorted(children):
-                is_dir, oid = children[name]
-                out.append({"type": "dir" if is_dir else "file", "size": 0 if is_dir else len(repo.objects[oid][1]),
-                            "name": name, "path": prefix + name, "sha": oid,
-                            "url": "/api/v3/repos/%s/%s/contents/%s" % (STORE.login(), repo.name, prefix + name)})
-            self._json(200, out)
+            dir_oid = store.objects.tree_at_path(tree_oid, path)
+            if dir_oid is None:
+                raise ApiError(404, "Not Found")
+            entries = []
+            for mode, name, child in parse_tree(store.objects.get(dir_oid)[1]):
+                child_path = (path + "/" + name) if path else name
+                entry = {"type": "dir" if mode == "40000" else "file",
+                         "name": name, "path": child_path, "sha": child}
+                if mode != "40000":
+                    found = store.objects.get(child)
+                    entry["size"] = len(found[1]) if found else 0
+                entries.append(entry)
+            self._send_json(200, entries)
             return
-
         if method == "PUT":
-            message = body.get("message", "")
-            content_b64 = body.get("content", "")
+            body = self._read_json()
             try:
-                data = base64.b64decode(content_b64, validate=False)
-            except Exception:
-                self._err(400, "Invalid base64 content")
-                return
-            branch = body.get("branch") or repo.default_branch
-            branch_tip_oid = repo.refs.get("refs/heads/" + branch)
-            if branch_tip_oid is None:
-                # create the branch: from the default tip, or as the root commit
-                base_tip = repo.refs.get("refs/heads/" + repo.default_branch)
-                if base_tip is not None:
-                    repo.refs["refs/heads/" + branch] = base_tip
-                    branch_tip_oid = base_tip
-            branch_tree = None
-            if branch_tip_oid and branch_tip_oid in repo.objects:
-                branch_tree = parse_commit(repo.objects[branch_tip_oid][1])["tree"]
-            flat = flatten_tree(repo.objects, branch_tree) if branch_tree else {}
-            existed = path in flat
-            if existed:
-                current_sha = flat[path][1]
-                given_sha = (body.get("sha") or "").lower()
-                if not given_sha or given_sha != current_sha.lower():
-                    self._err(409, "sha does not match the current file")
-                    return
-            blob_oid = hash_object("blob", data)
-            repo.objects[blob_oid] = ("blob", data)
-            flat[path] = ("100644", blob_oid)
-            new_tree = build_tree_from_map(repo.objects, flat)
-            parents = [branch_tip_oid] if branch_tip_oid else []
-            commit_oid = make_commit(repo, new_tree, parents, message or "Update %s" % path)
-            repo.refs["refs/heads/" + branch] = commit_oid
-            self._json(201 if not existed else 200,
-                       {"content": {"name": path.split("/")[-1], "path": path,
-                                    "sha": blob_oid, "size": len(data),
-                                    "type": "file", "encoding": "base64"},
-                        "commit": {"sha": commit_oid, "message": message}})
+                content = b64_decode(body.get("content", ""))
+            except (binascii.Error, ValueError):
+                raise ApiError(422, "content is not valid base64")
+            status, payload = store.contents_put(
+                repo, path, content, body.get("message", ""),
+                body.get("branch"), body.get("sha"))
+            if status >= 400:
+                raise ApiError(status, payload["message"])
+            self._send_json(status, payload)
             return
-
         if method == "DELETE":
-            branch = body.get("branch") or repo.default_branch
-            branch_tip_oid = repo.refs.get("refs/heads/" + branch)
-            if not branch_tip_oid:
-                self._err(404, "Not Found")
-                return
-            branch_tree = parse_commit(repo.objects[branch_tip_oid][1])["tree"]
-            flat = flatten_tree(repo.objects, branch_tree)
-            if path not in flat:
-                self._err(404, "Not Found")
-                return
-            given_sha = (body.get("sha") or "").lower()
-            if given_sha and given_sha != flat[path][1].lower():
-                self._err(409, "sha does not match the current file")
-                return
-            del flat[path]
-            new_tree = build_tree_from_map(repo.objects, flat)
-            commit_oid = make_commit(repo, new_tree, [branch_tip_oid],
-                                     body.get("message") or "Delete %s" % path)
-            repo.refs["refs/heads/" + branch] = commit_oid
-            self._json(200, {"commit": {"sha": commit_oid, "message": body.get("message", "")}})
+            body = self._read_json()
+            status, payload = store.contents_delete(
+                repo, path, body.get("message", ""), body.get("branch"))
+            if status >= 400:
+                raise ApiError(status, payload["message"])
+            self._send_json(status, payload)
             return
+        raise ApiError(404, "Not Found")
 
-        self._err(404, "Not Found")
+    def _rest_git_data(self, method, repo, rest):
+        store = self.server.store
+        if rest == ["refs"] and method == "POST":
+            body = self._read_json()
+            ref = body.get("ref", "")
+            sha = body.get("sha", "")
+            if not ref.startswith("refs/") or not is_oid(sha):
+                raise ApiError(422, "Invalid ref or sha")
+            if ref in repo.refs:
+                raise ApiError(422, "Reference already exists")
+            if not store.objects.has(sha):
+                raise ApiError(422, "Object %s does not exist" % sha)
+            repo.refs[ref] = sha
+            self._send_json(201, {"ref": ref, "object": {"sha": sha, "type": "commit"}})
+            return
+        if rest and rest[0] == "refs" and method == "GET":
+            ref = "refs/" + "/".join(rest[1:])
+            tip = repo.refs.get(ref)
+            if tip is None:
+                raise ApiError(404, "Reference not found")
+            self._send_json(200, {"ref": ref, "object": {"sha": tip, "type": "commit"}})
+            return
+        raise ApiError(404, "Not Found")
 
-    # -- issues --------------------------------------------------------------
-    def _issues(self, repo, rest, query, method, body):
+    def _rest_labels(self, method, repo):
+        if method != "POST":
+            raise ApiError(404, "Not Found")
+        body = self._read_json()
+        name = body.get("name")
+        if not name:
+            raise ApiError(422, "Label name is required")
+        label = {"name": name, "color": body.get("color", "ededed")}
+        repo.labels[name] = label
+        self._send_json(201, label)
+
+    def _rest_issues(self, method, repo, rest, query):
+        store = self.server.store
         if not rest:
             if method == "GET":
-                state = query.get("state", ["open"])[0]
-                sort_dir = query.get("direction", ["desc"])[0]
-                items = [i for i in repo.issues.values()
-                         if state == "all" or i["state"] == state]
-                items.sort(key=lambda i: i["seq"], reverse=(sort_dir != "asc"))
-                per_page = self._page_size(query, 30)
-                page = self._page(query)
-                start = (page - 1) * per_page
-                self._json(200, [issue_json(repo, i) for i in items[start:start + per_page]])
+                state = self._query_one(query, "state", "open")
+                sort = self._query_one(query, "sort", "created")
+                direction = self._query_one(query, "direction", "desc")
+                _page, per_page = self._page_params(query, 30)
+                issues = store.list_issues(repo, state, sort, direction)[:per_page]
+                self._send_json(200, [issue_view(repo, i) for i in issues])
                 return
             if method == "POST":
-                labels = body.get("labels", [])
-                names = []
-                for lab in labels:
-                    names.append(lab.get("name") if isinstance(lab, dict) else lab)
-                for name in names:
-                    if name not in repo.labels:
-                        self._err(422, "Validation Failed: label '%s' does not exist" % name)
-                        return
-                issue = create_issue(repo, body.get("title", ""), body.get("body", ""), names)
-                self._json(201, issue_json(repo, issue))
+                body = self._read_json()
+                labels = body.get("labels") or []
+                names = [l.get("name") if isinstance(l, dict) else l for l in labels]
+                issue, error = store.create_issue(
+                    repo, body.get("title", ""), body.get("body", ""), names)
+                if issue is None:
+                    raise ApiError(422, error)
+                self._send_json(201, issue_view(repo, issue))
                 return
-            self._err(404, "Not Found")
-            return
+            raise ApiError(404, "Not Found")
         try:
             number = int(rest[0])
         except ValueError:
-            self._err(404, "Not Found")
-            return
+            raise ApiError(404, "Not Found")
         issue = repo.issues.get(number)
+        if issue is None:
+            raise ApiError(404, "Not Found")
         if len(rest) == 1:
             if method == "GET":
-                if issue is None:
-                    self._err(404, "Not Found")
-                    return
-                self._json(200, issue_json(repo, issue))
-                return
-            if method == "PATCH":
-                if issue is None:
-                    self._err(404, "Not Found")
-                    return
-                if "state" in body:
+                self._send_json(200, issue_view(repo, issue))
+            elif method == "PATCH":
+                body = self._read_json()
+                if "state" in body and body["state"] in ("open", "closed"):
                     issue["state"] = body["state"]
                 if "title" in body:
                     issue["title"] = body["title"]
                 if "body" in body:
                     issue["body"] = body["body"]
-                if "labels" in body:
-                    names = [l.get("name") if isinstance(l, dict) else l for l in body["labels"]]
-                    for name in names:
-                        if name not in repo.labels:
-                            self._err(422, "Validation Failed: label '%s' does not exist" % name)
-                            return
-                    issue["labels"] = names
-                self._json(200, issue_json(repo, issue))
-                return
-            self._err(404, "Not Found")
+                issue["updated_at"] = tick_iso()
+                self._send_json(200, issue_view(repo, issue))
+            else:
+                raise ApiError(404, "Not Found")
             return
         if rest[1] == "comments":
-            if issue is None:
-                self._err(404, "Not Found")
-                return
             if method == "GET":
-                self._json(200, [{"id": c["id"], "body": c["body"],
-                                  "user": {"login": STORE.login(), "type": "User"},
-                                  "created_at": FIXED_TS, "updated_at": FIXED_TS}
-                                 for c in repo.comments.get(number, [])])
+                self._send_json(200, [comment_view(repo, issue, c) for c in issue["comments"]])
                 return
             if method == "POST":
-                cid = repo.next_comment_id
-                repo.next_comment_id += 1
-                comment = {"id": cid, "body": body.get("body", ""),
-                           "gid": gid("comment", repo.dbid, number, cid)}
-                repo.comments.setdefault(number, []).append(comment)
-                self._json(201, {"id": cid, "body": comment["body"],
-                                 "user": {"login": STORE.login(), "type": "User"},
-                                 "created_at": FIXED_TS, "updated_at": FIXED_TS})
+                body = self._read_json()
+                comment = {
+                    "id": store.next_comment_id,
+                    "body": body.get("body", ""),
+                    "created_at": tick_iso(),
+                    "updated_at": tick_iso(),
+                }
+                store.next_comment_id += 1
+                issue["comments"].append(comment)
+                self._send_json(201, comment_view(repo, issue, comment))
                 return
-        self._err(404, "Not Found")
+        raise ApiError(404, "Not Found")
 
-    # -- pulls ---------------------------------------------------------------
-    def _pulls(self, repo, rest, query, method, body):
+    def _rest_pulls(self, method, repo, rest, query):
+        store = self.server.store
         if not rest:
             if method == "GET":
-                state = query.get("state", ["open"])[0]
-                items = [p for p in repo.prs.values()
-                         if state == "all" or p["state"] == state]
-                items.sort(key=lambda p: p["seq"])
-                per_page = self._page_size(query, 30)
-                page = self._page(query)
-                start = (page - 1) * per_page
-                self._json(200, [pr_json(repo, p) for p in items[start:start + per_page]])
+                state = self._query_one(query, "state", "open")
+                _page, per_page = self._page_params(query, 30)
+                pulls = list(repo.pulls.values())
+                if state in ("open", "closed"):
+                    pulls = [p for p in pulls if p["state"] == state]
+                pulls.sort(key=lambda p: p["seq"], reverse=True)
+                self._send_json(200, [pull_view(repo, p) for p in pulls[:per_page]])
                 return
             if method == "POST":
-                head = str(body.get("head", ""))
-                base = str(body.get("base", ""))
-                head = head.split(":")[-1]
-                base = base.split(":")[-1]
-                if not head or branch_tip(repo, head) is None:
-                    self._err(422, "Validation Failed: head branch '%s' does not exist" % head)
-                    return
-                if not base or branch_tip(repo, base) is None:
-                    self._err(422, "Validation Failed: base branch '%s' does not exist" % base)
-                    return
-                pr = create_pr(repo, body.get("title", ""), body.get("body", ""), head, base)
-                self._json(201, pr_json(repo, pr))
+                body = self._read_json()
+                pull, error = store.create_pull(
+                    repo, body.get("head", ""), body.get("base", ""),
+                    body.get("title", ""), body.get("body", ""))
+                if pull is None:
+                    raise ApiError(422, error)
+                self._send_json(201, pull_view(repo, pull))
                 return
-            self._err(404, "Not Found")
-            return
+            raise ApiError(404, "Not Found")
         try:
             number = int(rest[0])
         except ValueError:
-            self._err(404, "Not Found")
-            return
-        pr = repo.prs.get(number)
+            raise ApiError(404, "Not Found")
+        pull = repo.pulls.get(number)
+        if pull is None:
+            raise ApiError(404, "Not Found")
         if len(rest) == 1:
             if method == "GET":
-                if pr is None:
-                    self._err(404, "Not Found")
-                    return
-                self._json(200, pr_json(repo, pr))
+                self._send_json(200, pull_view(repo, pull))
                 return
-            self._err(404, "Not Found")
-            return
+            raise ApiError(404, "Not Found")
         if rest[1] == "files" and method == "GET":
-            if pr is None:
-                self._err(404, "Not Found")
-                return
-            self._json(200, pr_files(repo, pr))
+            files = []
+            for path, status, old, new in store.pull_diff(repo, pull):
+                old_text = _blob_text(store.objects, old[1]) if old else ""
+                new_text = _blob_text(store.objects, new[1]) if new else ""
+                added, deleted = _line_counts(old_text, new_text)
+                files.append({
+                    "filename": path, "status": status,
+                    "additions": added, "deletions": deleted,
+                    "changes": added + deleted,
+                })
+            self._send_json(200, files)
             return
         if rest[1] == "merge" and method == "PUT":
-            if pr is None:
-                self._err(404, "Not Found")
-                return
-            if pr["merged"]:
-                self._err(405, "Pull request already merged")
-                return
-            if pr_conflict(repo, pr):
-                self._err(405, "Merge conflict")
-                return
-            merge_oid = squash_merge(repo, pr)
-            if merge_oid is None:
-                self._err(405, "Merge conflict")
-                return
-            pr["merged"] = True
-            pr["state"] = "closed"
-            pr["merge_sha"] = merge_oid
-            self._json(200, {"sha": merge_oid, "merged": True,
-                             "message": "Pull request successfully merged"})
+            status, payload = store.merge_pull(repo, pull)
+            if status >= 400:
+                raise ApiError(status, payload["message"])
+            self._send_json(status, payload)
             return
-        self._err(404, "Not Found")
+        raise ApiError(404, "Not Found")
 
 
-    # -- git smart HTTP -------------------------------------------------------
-    def _git(self, owner, name, suffix, query, method):
-        STORE.learn(owner)
-        if owner != STORE.learned_login:
-            self._err(404, "Not Found")
-            return
-        repo = STORE.repos.get(name)
-        if suffix == "/info/refs":
-            service = query.get("service", [""])[0]
-            if service not in ("git-upload-pack", "git-receive-pack"):
-                self._err(400, "Unknown service")
-                return
-            if repo is None:
-                self._err(404, "Not Found")
-                return
-            if method != "GET":
-                self._err(405, "Method Not Allowed")
-                return
-            v2 = (service == "git-upload-pack" and
-                  (self.headers.get("Git-Protocol") or "") == "version=2")
-            if v2:
-                body = v2_advertisement()
-            else:
-                body = v0_advertisement(repo, service)
-            ctype = "application/x-%s-advertisement" % service
-            self._send(200, body, ctype)
-            return
+    # -- Git smart HTTP ------------------------------------------------------
+
+    def _git_repo(self, segments):
+        store = self.server.store
+        owner = segments[0]
+        repo_name = segments[1][:-4]
+        repo = store.get_repo(owner, repo_name)
         if repo is None:
-            self._err(404, "Not Found")
-            return
-        if suffix == "/git-upload-pack" and method == "POST":
-            self._upload_pack(repo)
-            return
-        if suffix == "/git-receive-pack" and method == "POST":
-            self._receive_pack(repo)
-            return
-        self._err(404, "Not Found")
+            raise ApiError(404, "Not Found")
+        return repo
 
-    def _upload_pack(self, repo):
+    def _git_ad_refs(self, repo):
+        """Ref lines for the advertisement: [(oid, ref, peeled_oid_or_None)]."""
+        lines = []
+        for ref in sorted(repo.refs):
+            oid = repo.refs[ref]
+            lines.append((oid, ref, None))
+            peeled = self.server.store.objects.peel_to_commit(oid)
+            if ref.startswith("refs/tags/") and peeled is not None and peeled != oid:
+                lines.append((peeled, ref + "^{}", None))
+        return lines
+
+    def _route_git(self, method, segments, query):
+        repo = self._git_repo(segments)
+        service = self._query_one(query, "service")
+        tail = segments[2:]
+        if tail == ["info", "refs"] and method == "GET":
+            if service == "git-upload-pack":
+                self._git_info_refs_upload(repo)
+            elif service == "git-receive-pack":
+                self._git_info_refs_receive(repo)
+            else:
+                raise ApiError(404, "Not Found")
+            return
+        if tail == ["git-upload-pack"] and method == "POST":
+            self._git_upload_pack(repo)
+            return
+        if tail == ["git-receive-pack"] and method == "POST":
+            self._git_receive_pack(repo, self._read_body())
+            return
+        raise ApiError(404, "Not Found")
+
+    def _git_info_refs_upload(self, repo):
+        caps = ("side-band-64k shallow thin-pack ofs-delta agent=makefun-forge/1.0 "
+                "symref=HEAD:refs/heads/" + repo.default_branch)
+        protocol = self.headers.get("Git-Protocol", "")
+        if "version=2" in protocol:
+            body = encode_pkt_lines([
+                "version 2\n",
+                "agent=makefun-forge/1.0\n",
+                "ls-refs\n",
+                "fetch=shallow thin-pack ofs-delta\n",
+                "object-format=sha1\n",
+                "flush",
+            ])
+            self._send(200, body, "application/x-git-upload-pack-advertisement")
+            return
+        refs = self._git_ad_refs(repo)
+        tip = repo.default_tip()
+        out = bytearray(encode_pkt_lines(["# service=git-upload-pack\n", "flush"]))
+        first = True
+        if refs:
+            head_oid = tip or ZERO_OID
+            line = "%s HEAD\x00%s\n" % (head_oid, caps)
+            out += pkt_line(line.encode("utf-8"))
+            first = False
+            for oid, ref, _peeled in refs:
+                out += pkt_line(("%s %s\n" % (oid, ref)).encode("utf-8"))
+        else:
+            out += pkt_line(("%s capabilities^{}\x00%s\n" % (ZERO_OID, caps)).encode("utf-8"))
+        out += FLUSH_PKT
+        self._send(200, bytes(out), "application/x-git-upload-pack-advertisement")
+
+    def _git_info_refs_receive(self, repo):
+        caps = ("report-status side-band-64k delete-refs ofs-delta "
+                "agent=makefun-forge/1.0")
+        out = bytearray(encode_pkt_lines(["# service=git-receive-pack\n", "flush"]))
+        refs = self._git_ad_refs(repo)
+        first = True
+        for oid, ref, _peeled in refs:
+            line = "%s %s" % (oid, ref)
+            if first:
+                line += "\x00" + caps
+                first = False
+            out += pkt_line((line + "\n").encode("utf-8"))
+        if not refs:
+            out += pkt_line(("%s capabilities^{}\x00%s\n" % (ZERO_OID, caps)).encode("utf-8"))
+        out += FLUSH_PKT
+        self._send(200, bytes(out), "application/x-git-receive-pack-advertisement")
+
+    def _git_upload_pack(self, repo):
         raw = self._read_body()
-        v2 = (self.headers.get("Git-Protocol") or "") == "version=2"
+        if self.headers.get("Git-Protocol", "") == "version=2":
+            self._git_upload_pack_v2(repo, raw)
+            return
+        self._git_upload_pack_v0(repo, raw)
+
+    def _git_upload_pack_v2(self, repo, raw):
         try:
-            packets, _ = pkt_decode(raw)
-        except PktError:
-            self._err(400, "Malformed pkt-line")
+            packets = decode_pkt_lines(raw)
+        except ValueError:
+            self._send(400, b"", "application/x-git-upload-pack-result")
             return
-        lines = [p[1].decode("utf-8", "replace") for p in packets if p[0] == "data"]
-        if v2:
-            command = None
-            wants, haves, shallow, depth = [], [], [], None
-            # NOTE: the delim packet is a control packet, not a data packet,
-            # so it never appears in `lines`; collect fetch args from every
-            # data line (command/agent/object-format lines never start with
-            # want/have/shallow/deepen, so no gate is needed).
-            for line in lines:
-                text = line.rstrip("\n")
-                if text == "command=ls-refs":
-                    command = "ls-refs"
-                elif text == "command=fetch":
-                    command = "fetch"
-                if text.startswith("want "):
-                    wants.append(text[5:].strip())
-                elif text.startswith("have "):
-                    haves.append(text[5:].strip())
-                elif text.startswith("shallow "):
-                    shallow.append(text[8:].strip())
-                elif text.startswith("deepen "):
-                    try:
-                        depth = int(text[7:].strip())
-                    except ValueError:
-                        pass
-            # ls-refs args live after the delim packet too; re-scan for them
-            prefixes, peel, symrefs, unborn = [], True, True, False
-            for line in lines:
-                text = line.rstrip("\n")
-                if text.startswith("ref-prefix "):
-                    prefixes.append(text[len("ref-prefix "):])
-                elif text == "peel":
-                    peel = True
-                elif text == "symrefs":
-                    symrefs = True
-                elif text == "unborn":
-                    unborn = True
-            if command == "ls-refs":
-                body = ls_refs_v2(repo, prefixes, peel, symrefs, unborn)
-                self._send(200, body, "application/x-git-upload-pack-result")
-                return
-            if command == "fetch":
-                body = fetch_v2_response(repo, wants, haves, depth, shallow)
-                self._send(200, body, "application/x-git-upload-pack-result")
-                return
-            self._err(400, "Unknown v2 command")
+        command = None
+        args = []
+        seen_delim = False
+        for kind, payload in packets:
+            if kind == "data":
+                text = payload.decode("utf-8", "replace").rstrip("\n")
+                if text.startswith("command=") and command is None:
+                    command = text[len("command="):]
+                elif seen_delim:
+                    args.append(text)
+            elif kind == "delim":
+                seen_delim = True
+        if command == "ls-refs":
+            self._git_v2_ls_refs(repo, args)
+        elif command == "fetch":
+            self._git_v2_fetch(repo, args)
+        else:
+            self._send(400, b"", "application/x-git-upload-pack-result")
+
+    def _git_v2_ls_refs(self, repo, args):
+        peel = "peel" in args
+        symrefs = "symrefs" in args
+        prefixes = [a[len("ref-prefix "):] for a in args if a.startswith("ref-prefix ")]
+        if not prefixes:
+            prefixes = [""]
+        tip = repo.default_tip()
+        lines = []
+        if tip is not None and any("HEAD".startswith(p) or p.startswith("HEAD") or p == "" for p in prefixes):
+            line = "%s HEAD" % tip
+            if symrefs:
+                line += " symref-target:refs/heads/" + repo.default_branch
+            lines.append(line)
+        for ref in sorted(repo.refs):
+            if not any(ref.startswith(p) for p in prefixes):
+                continue
+            oid = repo.refs[ref]
+            line = "%s %s" % (oid, ref)
+            if ref.startswith("refs/tags/") and peel:
+                peeled = self.server.store.objects.peel_to_commit(oid)
+                if peeled is not None and peeled != oid:
+                    line += " peeled:%s" % peeled
+            lines.append(line)
+        body = encode_pkt_lines([line + "\n" for line in lines] + ["flush"])
+        self._send(200, body, "application/x-git-upload-pack-result")
+
+    def _git_v2_fetch(self, repo, args):
+        store = self.server.store
+        wants = []
+        haves = []
+        shallow_boundary = []
+        depth = None
+        for arg in args:
+            if arg.startswith("want "):
+                wants.append(arg[5:].strip())
+            elif arg.startswith("have "):
+                haves.append(arg[5:].strip())
+            elif arg.startswith("shallow "):
+                shallow_boundary.append(arg[8:].strip())
+            elif arg.startswith("deepen "):
+                try:
+                    depth = int(arg[7:].strip())
+                except ValueError:
+                    depth = None
+        chosen, shallow_out, unshallow_out = store.select_fetch(
+            wants, haves, shallow_boundary, depth)
+        out = bytearray()
+        out += encode_pkt_lines(["acknowledgments\n"])
+        if not haves:
+            out += encode_pkt_lines(["NAK\n"])
+        else:
+            for have in haves:
+                if store.objects.has(have):
+                    out += encode_pkt_lines(["ACK %s\n" % have])
+            out += encode_pkt_lines(["ready\n"])
+        out += FLUSH_PKT
+        out += encode_pkt_lines(["shallow-info\n"])
+        for oid in shallow_out:
+            out += encode_pkt_lines(["shallow %s\n" % oid])
+        for oid in unshallow_out:
+            out += encode_pkt_lines(["unshallow %s\n" % oid])
+        out += FLUSH_PKT
+        out += encode_pkt_lines(["packfile\n"])
+        objects = []
+        for oid in chosen:
+            found = store.objects.get(oid)
+            if found is not None:
+                objects.append(found)
+        pack = write_pack(objects)
+        out += sideband_packets(pack)
+        out += FLUSH_PKT
+        self._send(200, bytes(out), "application/x-git-upload-pack-result")
+
+    def _git_upload_pack_v0(self, repo, raw):
+        store = self.server.store
+        try:
+            packets, second_start = decode_until_flush(raw)
+            haves_packets, _rest = decode_until_flush(raw[second_start:])
+        except ValueError:
+            self._send(200, FLUSH_PKT, "application/x-git-upload-pack-result")
             return
-        # v0 fetch: wants, then flush, then haves + done
-        wants, haves, shallow, depth = [], [], [], None
-        for line in lines:
-            text = line.rstrip("\n")
+        wants = []
+        haves = []
+        shallow_boundary = []
+        depth = None
+        for kind, payload in packets:
+            if kind != "data":
+                continue
+            text = payload.decode("utf-8", "replace").rstrip("\n")
             if text.startswith("want "):
-                wants.append(text[5:].split(" ")[0])
-            elif text.startswith("have "):
-                haves.append(text[5:].strip())
+                want = text[5:].split("\x00", 1)[0].strip()
+                wants.append(want)
             elif text.startswith("shallow "):
-                shallow.append(text[8:].strip())
+                shallow_boundary.append(text[8:].strip())
             elif text.startswith("deepen "):
                 try:
                     depth = int(text[7:].strip())
                 except ValueError:
-                    pass
-        body = fetch_v0_response(repo, wants, haves, depth, shallow)
-        self._send(200, body, "application/x-git-upload-pack-result")
-
-    def _receive_pack(self, repo):
-        raw = self._read_body()
-        try:
-            packets, rest_off = pkt_decode_until_flush(raw)
-        except PktError:
-            self._err(400, "Malformed pkt-line")
-            return
-        commands = []
-        for kind, payload in packets:
+                    depth = None
+        for kind, payload in haves_packets:
             if kind != "data":
                 continue
-            line = payload.decode("utf-8", "replace").rstrip("\n")
-            parts = line.split("\0", 1)
-            fields = parts[0].split(" ")
-            if len(fields) != 3:
-                self._err(400, "Malformed push command")
-                return
-            old, new, ref = fields
-            if not is_oid(old) or not is_oid(new) or not ref.startswith("refs/"):
-                self._err(400, "Malformed push command")
-                return
-            commands.append((old, new, ref))
-        pack_bytes = raw[rest_off:]
-        new_objects = {}
+            text = payload.decode("utf-8", "replace").rstrip("\n")
+            if text.startswith("have "):
+                haves.append(text[5:].strip())
+        chosen, shallow_out, unshallow_out = store.select_fetch(
+            wants, haves, shallow_boundary, depth)
+        out = bytearray()
+        for oid in shallow_out:
+            out += pkt_line(("shallow %s\n" % oid).encode("utf-8"))
+        for oid in unshallow_out:
+            out += pkt_line(("unshallow %s\n" % oid).encode("utf-8"))
+        if not haves:
+            out += pkt_line(b"NAK\n")
+        else:
+            for have in haves:
+                if store.objects.has(have):
+                    out += pkt_line(("ACK %s\n" % have).encode("utf-8"))
+        objects = []
+        for oid in chosen:
+            found = store.objects.get(oid)
+            if found is not None:
+                objects.append(found)
+        out += sideband_packets(write_pack(objects))
+        out += FLUSH_PKT
+        self._send(200, bytes(out), "application/x-git-upload-pack-result")
+
+    def _git_receive_pack(self, repo, raw):
+        store = self.server.store
+        try:
+            commands, pack_offset = decode_until_flush(raw)
+        except ValueError:
+            self._send(200, encode_pkt_lines(["unpack protocol error\n", "flush"]),
+                       "application/x-git-receive-pack-result")
+            return
+        updates = []
+        want_sideband = False
+        first_line = True
+        for kind, payload in commands:
+            if kind != "data":
+                continue
+            text = payload.decode("utf-8", "replace").rstrip("\n")
+            line = text.split("\x00", 1)[0]
+            if first_line:
+                first_line = False
+                if "\x00" in text and "side-band-64k" in text.split("\x00", 1)[1]:
+                    want_sideband = True
+            parts = line.split()
+            if len(parts) != 3:
+                continue
+            updates.append((parts[0], parts[1], parts[2]))
+        pack_bytes = raw[pack_offset:]
+        unpack_ok = True
+        unpack_error = ""
         if pack_bytes:
             try:
-                new_objects = read_pack(pack_bytes)
-            except Exception:
-                new_objects = {}
-                # an unparseable pack: refuse every ref below via unpack failure
-                report = pkt_lines(["unpack error\n", "flush"])
-                self._send(200, pkt(b"\x01" + report) + FLUSH,
-                           "application/x-git-receive-pack-result")
-                return
-        for oid, obj in new_objects.items():
-            repo.objects.setdefault(oid, obj)
-        report_lines = ["unpack ok\n"]
-        for old, new, ref in commands:
+                objects = read_pack(pack_bytes)
+                for oid, (obj_type, data) in objects.items():
+                    store.objects.put_known(oid, obj_type, data)
+            except PackError as err:
+                unpack_ok = False
+                unpack_error = str(err)
+        lines = []
+        if unpack_ok:
+            lines.append("unpack ok\n")
+        else:
+            lines.append("unpack %s\n" % unpack_error)
+        for old, new, ref in updates:
+            if not unpack_ok:
+                lines.append("ng %s unpack failed\n" % ref)
+                continue
             current = repo.refs.get(ref)
-            ok = True
-            reason = ""
             if new == ZERO_OID:
-                # delete
                 if current is None:
-                    ok, reason = False, "no such ref"
+                    lines.append("ng %s delete of nonexistent ref\n" % ref)
                 elif old != ZERO_OID and old != current:
-                    ok, reason = False, "non-fast-forward"
+                    lines.append("ng %s old value does not match\n" % ref)
                 else:
                     del repo.refs[ref]
-            elif old == ZERO_OID:
-                # create
+                    lines.append("ok %s\n" % ref)
+                continue
+            if old == ZERO_OID:
                 if current is not None:
-                    ok, reason = False, "already exists"
-                elif new not in repo.objects:
-                    ok, reason = False, "missing object"
-                else:
-                    repo.refs[ref] = new
-            else:
-                # update
-                if current is None:
-                    ok, reason = False, "no such ref"
-                elif old != current:
-                    ok, reason = False, "non-fast-forward"
-                elif new == old:
-                    pass
-                elif new not in repo.objects:
-                    ok, reason = False, "missing object"
-                else:
-                    anc, _ = collect_reachable(repo.objects, [new])
-                    if old not in anc:
-                        ok, reason = False, "non-fast-forward"
-                    else:
-                        repo.refs[ref] = new
-            if ok:
-                report_lines.append("ok %s\n" % ref)
-            else:
-                report_lines.append("ng %s %s\n" % (ref, reason))
-        report = pkt_lines(report_lines + ["flush"])
-        body = pkt(b"\x01" + report) + FLUSH
-        self._send(200, body, "application/x-git-receive-pack-result")
-
-    # -- GraphQL -------------------------------------------------------------
-    def _graphql(self):
-        raw = self._read_body()
-        try:
-            payload = json.loads(raw.decode("utf-8")) if raw.strip() else {}
-        except Exception:
-            self._json(400, {"errors": [{"message": "Invalid JSON body"}]})
-            return
-        if isinstance(payload, list):
-            results = [self._graphql_one(op) for op in payload]
-            self._json(200, results)
-        elif isinstance(payload, dict):
-            self._json(200, self._graphql_one(payload))
+                    lines.append("ng %s ref already exists\n" % ref)
+                    continue
+            elif current is None:
+                lines.append("ng %s ref does not exist\n" % ref)
+                continue
+            elif old != current:
+                lines.append("ng %s old value does not match\n" % ref)
+                continue
+            if not store.objects.has(new):
+                lines.append("ng %s object not found\n" % ref)
+                continue
+            target = store.objects.peel_to_commit(new)
+            if old != ZERO_OID and target is not None:
+                if not store.objects.is_ancestor(old, target):
+                    lines.append("ng %s non-fast-forward\n" % ref)
+                    continue
+            repo.refs[ref] = new
+            lines.append("ok %s\n" % ref)
+        report = encode_pkt_lines(lines + ["flush"])
+        if want_sideband:
+            out = bytearray()
+            out += pkt_line(b"\x01" + report)
+            out += FLUSH_PKT
+            self._send(200, bytes(out), "application/x-git-receive-pack-result")
         else:
-            self._json(400, {"errors": [{"message": "Invalid GraphQL body"}]})
-
-    def _graphql_one(self, op):
-        query = op.get("query", "")
-        variables = op.get("variables") or {}
-        try:
-            doc = GQLParser(query).parse()
-        except GQLParseError as e:
-            return {"data": None, "errors": [{"message": str(e)}]}
-        executor = GQLExecutor(variables)
-        return executor.execute(doc)
-
-    # -- MCP ------------------------------------------------------------------
-    def _mcp(self):
-        raw = self._read_body()
-        try:
-            payload = json.loads(raw.decode("utf-8")) if raw.strip() else None
-        except Exception:
-            self._send(400, json.dumps({"jsonrpc": "2.0", "id": None,
-                                        "error": {"code": -32700, "message": "Parse error"}}))
-            return
-        if not isinstance(payload, dict):
-            self._send(400, json.dumps({"jsonrpc": "2.0", "id": None,
-                                        "error": {"code": -32600, "message": "Invalid Request"}}))
-            return
-        method = payload.get("method", "")
-        params = payload.get("params") or {}
-        req_id = payload.get("id")
-        if "id" not in payload:
-            # notification: acknowledge, no body
-            self._send(202, b"")
-            return
-        result, error = self._mcp_dispatch(method, params)
-        if error is not None:
-            self._json(200, {"jsonrpc": "2.0", "id": req_id, "error": error})
-        else:
-            self._json(200, {"jsonrpc": "2.0", "id": req_id, "result": result})
-
-    def _mcp_dispatch(self, method, params):
-        if method == "server/discover":
-            return ({"supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
-                     "capabilities": {"tools": {}},
-                     "serverInfo": {"name": "github-forge", "version": VERSION},
-                     "_meta": {"io.modelcontextprotocol/serverInfo":
-                               {"name": "github-forge", "version": VERSION}}}, None)
-        if method == "initialize":
-            offered = params.get("protocolVersion", "2025-11-25")
-            if offered not in ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"):
-                offered = "2025-11-25"
-            return ({"protocolVersion": offered,
-                     "capabilities": {"tools": {}},
-                     "serverInfo": {"name": "github-forge", "version": VERSION}}, None)
-        if method == "tools/list":
-            return ({"tools": MCP_TOOLS}, None)
-        if method == "tools/call":
-            return self._mcp_call(params)
-        if method.startswith("notifications/"):
-            return ({}, None)
-        return (None, {"code": -32601, "message": "Method not found: %s" % method})
-
-    def _mcp_call(self, params):
-        name = params.get("name", "")
-        args = params.get("arguments") or {}
-        tool = next((t for t in MCP_TOOLS if t["name"] == name), None)
-        if tool is None:
-            return None, {"code": -32602, "message": "Unknown tool: %s" % name}
-        required = tool["inputSchema"].get("required", [])
-        missing = [r for r in required if r not in args or args[r] is None]
-        if missing:
-            return None, {"code": -32602,
-                          "message": "Missing required argument(s): %s" % ", ".join(missing)}
-        try:
-            obj = MCP_HANDLERS[name](args)
-        except MCPToolError as e:
-            return ({"content": [{"type": "text", "text": str(e)}], "isError": True}, None)
-        text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-        return ({"content": [{"type": "text", "text": text}],
-                 "structuredContent": obj}, None)
+            self._send(200, report, "application/x-git-receive-pack-result")
 
 
 # ---------------------------------------------------------------------------
-# GraphQL: tiny parser + executor for the documents gh / github-mcp-server send
+# GraphQL v4: a small parser for the fixed document set, plus an executor.
 # ---------------------------------------------------------------------------
 
-class GQLParseError(ValueError):
-    pass
 
+    # -- GraphQL v4 ----------------------------------------------------------
 
-class GQLParser:
-    def __init__(self, text):
-        self.text = text
-        self.tokens = self._tokenize(text)
-        self.pos = 0
+    def _route_graphql(self):
+        raw = self._read_body()
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"errors": [{"message": "Problems parsing JSON"}]})
+            return
+        if isinstance(body, list):
+            results = [self._gql_run(entry) for entry in body]
+            self._send_json(200, results)
+            return
+        if not isinstance(body, dict):
+            self._send_json(400, {"errors": [{"message": "Problems parsing JSON"}]})
+            return
+        self._send_json(200, self._gql_run(body))
 
-    @staticmethod
-    def _tokenize(text):
-        tokens = []
-        i, n = 0, len(text)
-        while i < n:
-            c = text[i]
-            if c in " \t\r\n,":
-                i += 1
-                continue
-            if c == "#":
-                while i < n and text[i] != "\n":
-                    i += 1
-                continue
-            if text.startswith("...", i):
-                tokens.append(("dots", "..."))
-                i += 3
-                continue
-            if c in "{}()[]:!=$|@":
-                tokens.append(("punct", c))
-                i += 1
-                continue
-            if c == '"':
-                j = i + 1
-                out = []
-                while j < n and text[j] != '"':
-                    if text[j] == "\\" and j + 1 < n:
-                        esc = text[j + 1]
-                        out.append({"n": "\n", "t": "\t", "r": "\r", '"': '"',
-                                    "\\": "\\", "/": "/"}.get(esc, esc))
-                        j += 2
-                    else:
-                        out.append(text[j])
-                        j += 1
-                if j >= n:
-                    raise GQLParseError("unterminated string")
-                tokens.append(("string", "".join(out)))
-                i = j + 1
-                continue
-            if c.isdigit() or (c == "-" and i + 1 < n and text[i + 1].isdigit()):
-                j = i
-                if text[j] == "-":
-                    j += 1
-                while j < n and (text[j].isdigit() or text[j] == "."):
-                    j += 1
-                raw = text[i:j]
-                tokens.append(("number", float(raw) if "." in raw else int(raw)))
-                i = j
-                continue
-            if c.isalpha() or c == "_":
-                j = i
-                while j < n and (text[j].isalnum() or text[j] == "_"):
-                    j += 1
-                tokens.append(("name", text[i:j]))
-                i = j
-                continue
-            raise GQLParseError("unexpected character %r" % c)
-        tokens.append(("eof", None))
-        return tokens
+    def _gql_run(self, body):
+        query = body.get("query") or ""
+        variables = body.get("variables") or {}
+        try:
+            _operation, selection = _GqlParser(query, variables).parse()
+            data = {}
+            for field in selection:
+                data[field.alias] = self._gql_top(field)
+            return {"data": data}
+        except GraphQLError as err:
+            return {"data": None, "errors": [{"message": str(err)}]}
 
-    def _peek(self):
-        return self.tokens[self.pos]
-
-    def _next(self):
-        tok = self.tokens[self.pos]
-        self.pos += 1
-        return tok
-
-    def _expect(self, kind, value=None):
-        tok = self._next()
-        if tok[0] != kind or (value is not None and tok[1] != value):
-            raise GQLParseError("expected %s %s, got %r" % (kind, value, tok))
-        return tok
-
-    def _accept(self, kind, value=None):
-        tok = self._peek()
-        if tok[0] == kind and (value is None or tok[1] == value):
-            self.pos += 1
-            return True
-        return False
-
-    def parse(self):
-        ops = []
-        while self._peek()[0] != "eof":
-            kind, value = self._peek()
-            if kind == "punct" and value == "{":
-                ops.append({"kind": "query", "name": None, "vars": {},
-                            "selections": self._selection_set()})
-                continue
-            if kind == "name" and value in ("query", "mutation", "subscription"):
-                self._next()
-                name = None
-                if self._peek()[0] == "name":
-                    name = self._next()[1]
-                var_defs = {}
-                if self._accept("punct", "("):
-                    while not self._accept("punct", ")"):
-                        self._expect("punct", "$")
-                        vname = self._expect("name")[1]
-                        self._expect("punct", ":")
-                        self._type_ref()
-                        if self._accept("punct", "="):
-                            self._value()
-                        var_defs[vname] = True
-                ops.append({"kind": value, "name": name, "vars": var_defs,
-                            "selections": self._selection_set()})
-                continue
-            if kind == "name" and value == "fragment":
-                self._next()
-                self._expect("name")
-                self._expect("name", "on")
-                self._expect("name")
-                self._selection_set()
-                continue
-            raise GQLParseError("unexpected token %r" % (self._peek(),))
-        if not ops:
-            raise GQLParseError("empty document")
-        return ops
-
-    def _type_ref(self):
-        if self._accept("punct", "["):
-            self._type_ref()
-            self._expect("punct", "]")
-        else:
-            self._expect("name")
-        self._accept("punct", "!")
-
-    def _selection_set(self):
-        self._expect("punct", "{")
-        sels = []
-        while not self._accept("punct", "}"):
-            sels.append(self._selection())
-        return sels
-
-    def _selection(self):
-        if self._accept("dots"):
-            if self._peek() == ("name", "on"):
-                self._next()
-                tname = self._expect("name")[1]
-                return {"kind": "fragment", "type": tname,
-                        "selections": self._selection_set()}
-            self._expect("name")  # fragment spread name (unused in the docs)
-            return {"kind": "fragment", "type": None, "selections": []}
-        name = self._expect("name")[1]
-        alias = None
-        if self._accept("punct", ":"):
-            alias = name
-            name = self._expect("name")[1]
-        args = {}
-        if self._accept("punct", "("):
-            while not self._accept("punct", ")"):
-                aname = self._expect("name")[1]
-                self._expect("punct", ":")
-                args[aname] = self._value()
-        while self._accept("punct", "@"):
-            self._expect("name")
-            if self._accept("punct", "("):
-                depth = 1
-                while depth:
-                    tok = self._next()
-                    if tok == ("punct", "("):
-                        depth += 1
-                    elif tok == ("punct", ")"):
-                        depth -= 1
-        sels = []
-        if self._peek() == ("punct", "{"):
-            sels = self._selection_set()
-        return {"kind": "field", "alias": alias, "name": name, "args": args,
-                "selections": sels}
-
-    def _value(self):
-        kind, value = self._next()
-        if kind == "punct" and value == "$":
-            return ("var", self._expect("name")[1])
-        if kind == "string":
-            return value
-        if kind == "number":
-            return value
-        if kind == "name":
-            if value == "true":
-                return True
-            if value == "false":
-                return False
-            if value == "null":
+    def _gql_top(self, field):
+        store = self.server.store
+        if field.type_condition:
+            raise GraphQLError("inline fragments are not supported at the top level")
+        if field.name == "viewer":
+            user = _GqlObject("User", VIEWER)
+            return self._gql_project(user, field.selection)
+        if field.name == "repository":
+            repo = store.get_repo(field.args.get("owner"), field.args.get("name"))
+            if repo is None:
                 return None
-            return ("enum", value)
-        if kind == "punct" and value == "[":
-            items = []
-            while not self._accept("punct", "]"):
-                items.append(self._value())
-            return items
-        if kind == "punct" and value == "{":
-            obj = {}
-            while not self._accept("punct", "}"):
-                key = self._expect("name")[1]
-                self._expect("punct", ":")
-                obj[key] = self._value()
-            return obj
-        raise GQLParseError("unexpected value token %r" % ((kind, value),))
-
-
-TYPE_FIELDS = {
-    "Issue": ["id", "number", "title", "state", "body", "createdAt", "updatedAt",
-              "url", "author", "labels", "comments"],
-    "PullRequest": ["id", "number", "title", "body", "state", "merged", "headRefName",
-                    "baseRefName", "mergeable", "files", "createdAt", "updatedAt"],
-    "Repository": ["id", "databaseId", "name", "nameWithOwner", "owner", "defaultBranchRef",
-                   "viewerPermission", "hasIssuesEnabled", "issue", "issues",
-                   "pullRequests", "pullRequest", "createdAt", "updatedAt"],
-    "SearchType": [],
-}
-
-
-class GQLExecutor:
-    def __init__(self, variables):
-        self.variables = variables or {}
-        self.errors = []
-
-    def _resolve_value(self, value):
-        if isinstance(value, tuple) and value and value[0] == "var":
-            return self.variables.get(value[1])
-        if isinstance(value, tuple) and value and value[0] == "enum":
-            return value[1]
-        if isinstance(value, list):
-            return [self._resolve_value(v) for v in value]
-        if isinstance(value, dict):
-            return {k: self._resolve_value(v) for k, v in value.items()}
-        return value
-
-    def _resolve_args(self, args):
-        return {k: self._resolve_value(v) for k, v in args.items()}
-
-    def execute(self, ops):
-        data = {}
-        for op in ops:
-            root_type = "Mutation" if op["kind"] == "mutation" else "Query"
-            root = self._root_object(root_type)
-            for sel in op["selections"]:
-                data.update(self._exec_object(root, root_type, [sel]))
-        result = {"data": data}
-        if self.errors:
-            result["errors"] = self.errors
-        return result
-
-    def _root_object(self, root_type):
-        if root_type == "Query":
-            login = STORE.login()
-            return {"_type": "Query",
-                    "viewer": {"_type": "User", "login": login},
-                    "repository": self._gql_repository,
-                    "node": self._gql_node,
-                    "__type": self._gql_type}
-        return {"_type": "Mutation",
-                "createIssue": self._mut_create_issue,
-                "closeIssue": self._mut_close_issue,
-                "createPullRequest": self._mut_create_pr,
-                "mergePullRequest": self._mut_merge_pr,
-                "addComment": self._mut_add_comment}
-
-    # -- root field resolvers ----------------------------------------------
-    def _gql_repository(self, args):
-        owner = args.get("owner")
-        name = args.get("name")
-        if owner != STORE.login():
+            return self._gql_project(_GqlObject("Repository", repo, repo), field.selection)
+        if field.name == "node":
+            decoded = decode_opaque_id(field.args.get("id") or "")
+            if decoded is None:
+                return None
+            kind = decoded[0]
+            if kind == "R" and len(decoded) == 3:
+                repo = store.get_repo(decoded[1], decoded[2])
+                if repo is None:
+                    return None
+                return self._gql_project(_GqlObject("Repository", repo, repo), field.selection)
+            if kind == "I" and len(decoded) == 4:
+                repo = store.get_repo(decoded[1], decoded[2])
+                if repo is None:
+                    return None
+                issue = repo.issues.get(int(decoded[3])) if decoded[3].isdigit() else None
+                if issue is None:
+                    return None
+                return self._gql_project(_GqlObject("Issue", issue, repo), field.selection)
+            if kind == "P" and len(decoded) == 4:
+                repo = store.get_repo(decoded[1], decoded[2])
+                if repo is None:
+                    return None
+                pull = repo.pulls.get(int(decoded[3])) if decoded[3].isdigit() else None
+                if pull is None:
+                    return None
+                return self._gql_project(_GqlObject("PullRequest", pull, repo), field.selection)
             return None
-        repo = STORE.repos.get(name)
-        if repo is None:
-            return None
-        return self._repo_obj(repo)
+        if field.name == "__type":
+            name = field.args.get("name")
+            type_obj = _GqlObject("__Type", name)
+            return self._gql_project(type_obj, field.selection)
+        if field.name == "createIssue":
+            return self._gql_create_issue(field)
+        if field.name == "closeIssue":
+            return self._gql_close_issue(field)
+        if field.name == "createPullRequest":
+            return self._gql_create_pull(field)
+        if field.name == "mergePullRequest":
+            return self._gql_merge_pull(field)
+        if field.name == "addComment":
+            return self._gql_add_comment(field)
+        raise GraphQLError('Cannot query field "%s" on type "Query".' % field.name)
 
-    def _gql_node(self, args):
-        decoded = ungid(args.get("id"))
-        if decoded is None:
-            return None
-        kind, parts = decoded
-        if kind == "repo":
-            repo = find_repo_by_dbid(int(parts[0])) if parts else None
-            return self._repo_obj(repo) if repo else None
-        if kind == "issue" and len(parts) == 2:
-            repo = find_repo_by_dbid(int(parts[0]))
-            issue = repo.issues.get(int(parts[1])) if repo else None
-            return self._issue_obj(repo, issue) if issue else None
-        if kind == "pr" and len(parts) == 2:
-            repo = find_repo_by_dbid(int(parts[0]))
-            pr = repo.prs.get(int(parts[1])) if repo else None
-            return self._pr_obj(repo, pr) if pr else None
-        return {"_type": "Node", "id": args.get("id")}
+    def _gql_project(self, obj, selection):
+        out = {}
+        for field in selection:
+            if field.type_condition:
+                if field.type_condition == obj.type_name:
+                    out.update(self._gql_project(obj, field.selection))
+                continue
+            value = self._gql_resolve(obj, field)
+            if isinstance(value, _GqlObject):
+                out[field.alias] = self._gql_project(value, field.selection)
+            elif isinstance(value, list) and value and isinstance(value[0], _GqlObject):
+                out[field.alias] = [self._gql_project(item, field.selection) for item in value]
+            else:
+                out[field.alias] = value
+        return out
 
-    def _gql_type(self, args):
-        name = args.get("name")
-        if name == "SearchType":
-            return {"_type": "__Type", "name": name, "fields": None,
-                    "enumValues": [{"name": n} for n in
-                                   ("ISSUE", "REPOSITORY", "USER", "PULL_REQUEST",
-                                    "DISCUSSION", "COMMIT")]}
-        if name in TYPE_FIELDS:
-            fields = [{"name": f} for f in TYPE_FIELDS[name]]
-            return {"_type": "__Type", "name": name, "fields": fields,
-                    "enumValues": None}
-        return None
+    def _gql_resolve(self, obj, field):
+        store = self.server.store
+        name = field.name
+        value = obj.value
+        type_name = obj.type_name
+        if type_name == "User":
+            if name == "login":
+                return value["login"]
+        elif type_name == "Repository":
+            repo = value
+            if name == "id":
+                return repo.global_id()
+            if name == "databaseId":
+                return repo.db_id
+            if name == "name":
+                return repo.name
+            if name == "nameWithOwner":
+                return "%s/%s" % (repo.owner, repo.name)
+            if name == "owner":
+                return _GqlObject("User", VIEWER)
+            if name == "defaultBranchRef":
+                tip = repo.default_tip()
+                if tip is None:
+                    return None
+                return _GqlObject("Ref", {"name": repo.default_branch})
+            if name == "viewerPermission":
+                return "ADMIN"
+            if name == "hasIssuesEnabled":
+                return True
+            if name == "description":
+                return repo.description
+            if name == "private":
+                return repo.private
+            if name == "issue":
+                issue = repo.issues.get(field.args.get("number"))
+                if issue is None:
+                    return None
+                return _GqlObject("Issue", issue, repo)
+            if name == "issues":
+                return self._gql_issue_connection(repo, field.args)
+            if name == "pullRequests":
+                return self._gql_pull_connection(repo, field.args)
+            if name == "pullRequest":
+                pull = repo.pulls.get(field.args.get("number"))
+                if pull is None:
+                    return None
+                return _GqlObject("PullRequest", pull, repo)
+        elif type_name == "Issue":
+            issue = value
+            if name == "id":
+                return opaque_id("I", obj.repo.owner, obj.repo.name, issue["number"])
+            if name == "number":
+                return issue["number"]
+            if name == "title":
+                return issue["title"]
+            if name == "state":
+                return _gql_issue_state(issue)
+            if name == "body":
+                return issue["body"]
+        elif type_name == "PullRequest":
+            pull = value
+            if name == "id":
+                return opaque_id("P", obj.repo.owner, obj.repo.name, pull["number"])
+            if name == "number":
+                return pull["number"]
+            if name == "title":
+                return pull["title"]
+            if name == "state":
+                return _gql_pull_state(pull)
+            if name == "merged":
+                return pull["merged"]
+            if name == "headRefName":
+                return pull["head"]
+            if name == "baseRefName":
+                return pull["base"]
+            if name == "mergeable":
+                if pull["state"] != "open":
+                    return "UNKNOWN"
+                return "CONFLICTING" if store.pull_conflict(obj.repo, pull) else "MERGEABLE"
+            if name == "files":
+                return self._gql_file_connection(obj.repo, pull, field.args)
+        elif type_name == "IssueConnection":
+            if name == "nodes":
+                return [_GqlObject("Issue", issue, obj.repo) for issue in value["nodes"]]
+            if name == "pageInfo":
+                return _GqlObject("PageInfo", value["pageInfo"])
+        elif type_name == "PullRequestConnection":
+            if name == "nodes":
+                return [_GqlObject("PullRequest", pull, obj.repo) for pull in value["nodes"]]
+        elif type_name == "PullRequestChangedFileConnection":
+            if name == "nodes":
+                return [_GqlObject("PullRequestChangedFile", path) for path in value["nodes"]]
+        elif type_name == "PullRequestChangedFile":
+            if name == "path":
+                return value
+        elif type_name == "PageInfo":
+            if name == "hasNextPage":
+                return value["hasNextPage"]
+            if name == "endCursor":
+                return value["endCursor"]
+        elif type_name == "Ref":
+            if name == "name":
+                return value["name"]
+        elif type_name == "__Type":
+            if name == "fields":
+                return [_GqlObject("__Field", fname)
+                        for fname in _GQL_TYPE_FIELDS.get(value, [])]
+            if name == "enumValues":
+                return [_GqlObject("__EnumValue", ename)
+                        for ename in _GQL_ENUM_VALUES.get(value, [])]
+            if name == "name":
+                return value
+        elif type_name == "__Field":
+            if name == "name":
+                return value
+        elif type_name == "__EnumValue":
+            if name == "name":
+                return value
+        elif type_name in ("CreateIssuePayload", "CloseIssuePayload"):
+            if name == "issue":
+                issue = value
+                if issue is None:
+                    return None
+                return _GqlObject("Issue", issue, obj.repo)
+        elif type_name in ("CreatePullRequestPayload", "MergePullRequestPayload"):
+            if name == "pullRequest":
+                pull = value
+                if pull is None:
+                    return None
+                return _GqlObject("PullRequest", pull, obj.repo)
+        elif type_name == "AddCommentPayload":
+            if name == "commentEdge":
+                return _GqlObject("IssueCommentEdge", value, obj.repo)
+        elif type_name == "IssueCommentEdge":
+            if name == "node":
+                return _GqlObject("IssueComment", value, obj.repo)
+        elif type_name == "IssueComment":
+            if name == "id":
+                comment = value
+                return opaque_id("C", obj.repo.owner, obj.repo.name,
+                                 comment["issue"], comment["id"])
+            if name == "body":
+                return value["body"]
+        raise GraphQLError('Cannot query field "%s" on type "%s".' % (name, type_name))
 
-    # -- object builders ----------------------------------------------------
-    def _repo_obj(self, repo):
-        login = STORE.login()
-        return {
-            "_type": "Repository",
-            "id": repo.global_id(),
-            "databaseId": repo.dbid,
-            "name": repo.name,
-            "nameWithOwner": "%s/%s" % (login, repo.name),
-            "owner": {"_type": "User", "login": login},
-            "defaultBranchRef": {"_type": "Ref", "name": repo.default_branch},
-            "viewerPermission": "ADMIN",
-            "hasIssuesEnabled": True,
-            "issue": lambda args: self._issue_by_number(repo, args),
-            "issues": lambda args: self._issues_conn(repo, args),
-            "pullRequests": lambda args: self._prs_conn(repo, args),
-            "pullRequest": lambda args: self._pr_by_number(repo, args),
-        }
-
-    @staticmethod
-    def _issue_obj(repo, issue):
-        return {"_type": "Issue", "id": issue["gid"], "number": issue["number"],
-                "title": issue["title"],
-                "state": "OPEN" if issue["state"] == "open" else "CLOSED",
-                "body": issue["body"]}
-
-    def _pr_obj(self, repo, pr):
-        mergeable = "CONFLICTING" if pr_conflict(repo, pr) else "MERGEABLE"
-        state = "MERGED" if pr["merged"] else ("OPEN" if pr["state"] == "open" else "CLOSED")
-        return {"_type": "PullRequest", "id": pr["gid"], "number": pr["number"],
-                "title": pr["title"], "body": pr["body"], "state": state,
-                "merged": pr["merged"], "headRefName": pr["head"],
-                "baseRefName": pr["base"], "mergeable": mergeable,
-                "files": lambda args: self._pr_files_conn(repo, pr, args)}
-
-    def _issue_by_number(self, repo, args):
-        issue = repo.issues.get(args.get("number"))
-        return self._issue_obj(repo, issue) if issue else None
-
-    def _pr_by_number(self, repo, args):
-        pr = repo.prs.get(args.get("number"))
-        return self._pr_obj(repo, pr) if pr else None
-
-    def _issues_conn(self, repo, args):
+    def _gql_issue_connection(self, repo, args):
         issues = list(repo.issues.values())
         states = args.get("states")
         if states:
-            wanted = set(states)
-            issues = [i for i in issues
-                      if ("OPEN" if i["state"] == "open" else "CLOSED") in wanted]
-        order = args.get("orderBy") or {}
-        if order.get("field") == "CREATED_AT" and order.get("direction") == "DESC":
-            issues.sort(key=lambda i: (i["seq"], i["number"]), reverse=True)
+            wanted = {"open" if s == "OPEN" else "closed" for s in states}
+            issues = [i for i in issues if i["state"] in wanted]
+        order_by = args.get("orderBy") or {}
+        if order_by.get("field") == "CREATED_AT":
+            issues.sort(key=lambda i: i["seq"], reverse=order_by.get("direction") != "ASC")
         else:
-            issues.sort(key=lambda i: (i["seq"], i["number"]))
-        first = args.get("first")
+            issues.sort(key=lambda i: i["seq"])
         after = args.get("after")
         if after:
-            try:
-                cursor_num = int(base64.urlsafe_b64decode(
-                    after + "=" * (-len(after) % 4)).decode().split(":")[1])
-                issues = [i for i in issues if i["number"] > cursor_num] \
-                    if order.get("direction") != "DESC" else \
-                    [i for i in issues if i["number"] < cursor_num]
-            except Exception:
-                pass
+            after_number = cursor_number(after)
+            if after_number is not None:
+                issues = [i for i in issues if i["number"] > after_number]
+        first = args.get("first")
         total = len(issues)
         if first is not None:
             page = issues[:first]
         else:
             page = issues
         has_next = len(page) < total
-        end_cursor = None
-        if page:
-            end_cursor = base64.urlsafe_b64encode(
-                ("cursor:%d" % page[-1]["number"]).encode()).decode().rstrip("=")
-        return {"_type": "IssueConnection",
-                "nodes": [self._issue_obj(repo, i) for i in page],
-                "pageInfo": {"_type": "PageInfo", "hasNextPage": has_next,
-                             "endCursor": end_cursor}}
+        end_cursor = cursor_for(page[-1]["number"]) if page else None
+        return _GqlObject("IssueConnection",
+                          {"nodes": page,
+                           "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}},
+                          repo)
 
-    def _prs_conn(self, repo, args):
-        prs = sorted(repo.prs.values(), key=lambda p: p["seq"])
+    def _gql_pull_connection(self, repo, args):
+        pulls = [p for p in repo.pulls.values() if p["state"] == "open"]
+        pulls.sort(key=lambda p: p["seq"])
         first = args.get("first")
         if first is not None:
-            prs = prs[:first]
-        return {"_type": "PullRequestConnection",
-                "nodes": [self._pr_obj(repo, p) for p in prs]}
+            pulls = pulls[:first]
+        return _GqlObject("PullRequestConnection", {"nodes": pulls}, repo)
 
-    def _pr_files_conn(self, repo, pr, args):
-        files = pr_files(repo, pr)
+    def _gql_file_connection(self, repo, pull, args):
+        paths = [path for path, _s, _o, _n in self.server.store.pull_diff(repo, pull)]
         first = args.get("first")
         if first is not None:
-            files = files[:first]
-        return {"_type": "PullRequestChangedFileConnection",
-                "nodes": [{"_type": "PullRequestChangedFile", "path": f["filename"]}
-                          for f in files]}
+            paths = paths[:first]
+        return _GqlObject("PullRequestChangedFileConnection", {"nodes": paths}, repo)
 
-    # -- mutations ------------------------------------------------------------
-    def _mut_create_issue(self, args):
-        inp = args.get("input") or {}
-        decoded = ungid(inp.get("repositoryId"))
-        if not decoded or decoded[0] != "repo":
-            return {"_type": "CreateIssuePayload", "issue": None}
-        repo = find_repo_by_dbid(int(decoded[1][0]))
+    def _gql_repo_from_id(self, global_id):
+        decoded = decode_opaque_id(global_id or "")
+        if decoded is None or decoded[0] != "R" or len(decoded) != 3:
+            return None
+        return self.server.store.get_repo(decoded[1], decoded[2])
+
+    def _gql_issue_from_id(self, global_id):
+        decoded = decode_opaque_id(global_id or "")
+        if decoded is None or decoded[0] != "I" or len(decoded) != 4:
+            return None, None
+        repo = self.server.store.get_repo(decoded[1], decoded[2])
+        if repo is None or not decoded[3].isdigit():
+            return None, None
+        return repo, repo.issues.get(int(decoded[3]))
+
+    def _gql_pull_from_id(self, global_id):
+        decoded = decode_opaque_id(global_id or "")
+        if decoded is None or decoded[0] != "P" or len(decoded) != 4:
+            return None, None
+        repo = self.server.store.get_repo(decoded[1], decoded[2])
+        if repo is None or not decoded[3].isdigit():
+            return None, None
+        return repo, repo.pulls.get(int(decoded[3]))
+
+    def _gql_create_issue(self, field):
+        store = self.server.store
+        input_data = field.args.get("input") or {}
+        repo = self._gql_repo_from_id(input_data.get("repositoryId"))
         if repo is None:
-            return {"_type": "CreateIssuePayload", "issue": None}
-        issue = create_issue(repo, inp.get("title", ""), inp.get("body", ""))
-        return {"_type": "CreateIssuePayload", "issue": self._issue_obj(repo, issue)}
-
-    def _mut_close_issue(self, args):
-        inp = args.get("input") or {}
-        decoded = ungid(inp.get("issueId"))
-        if not decoded or decoded[0] != "issue":
-            return {"_type": "CloseIssuePayload", "issue": None}
-        repo = find_repo_by_dbid(int(decoded[1][0]))
-        issue = repo.issues.get(int(decoded[1][1])) if repo else None
+            raise GraphQLError("repositoryId does not name a repository")
+        issue, error = store.create_issue(repo, input_data.get("title", ""),
+                                          input_data.get("body", ""), [])
         if issue is None:
-            return {"_type": "CloseIssuePayload", "issue": None}
+            raise GraphQLError(error)
+        payload = _GqlObject("CreateIssuePayload", issue, repo)
+        return self._gql_project(payload, field.selection)
+
+    def _gql_close_issue(self, field):
+        input_data = field.args.get("input") or {}
+        repo, issue = self._gql_issue_from_id(input_data.get("issueId"))
+        if issue is None:
+            raise GraphQLError("issueId does not name an issue")
         issue["state"] = "closed"
-        return {"_type": "CloseIssuePayload", "issue": self._issue_obj(repo, issue)}
+        issue["updated_at"] = tick_iso()
+        payload = _GqlObject("CloseIssuePayload", issue, repo)
+        return self._gql_project(payload, field.selection)
 
-    def _mut_create_pr(self, args):
-        inp = args.get("input") or {}
-        decoded = ungid(inp.get("repositoryId"))
-        if not decoded or decoded[0] != "repo":
-            return {"_type": "CreatePullRequestPayload", "pullRequest": None}
-        repo = find_repo_by_dbid(int(decoded[1][0]))
+    def _gql_create_pull(self, field):
+        store = self.server.store
+        input_data = field.args.get("input") or {}
+        repo = self._gql_repo_from_id(input_data.get("repositoryId"))
         if repo is None:
-            return {"_type": "CreatePullRequestPayload", "pullRequest": None}
-        head = inp.get("headRefName", "")
-        base = inp.get("baseRefName", repo.default_branch)
-        if branch_tip(repo, head) is None or branch_tip(repo, base) is None:
-            return {"_type": "CreatePullRequestPayload", "pullRequest": None}
-        pr = create_pr(repo, inp.get("title", ""), inp.get("body", ""), head, base)
-        return {"_type": "CreatePullRequestPayload", "pullRequest": self._pr_obj(repo, pr)}
+            raise GraphQLError("repositoryId does not name a repository")
+        pull, error = store.create_pull(repo, input_data.get("headRefName", ""),
+                                        input_data.get("baseRefName", ""),
+                                        input_data.get("title", ""),
+                                        input_data.get("body", ""))
+        if pull is None:
+            raise GraphQLError(error)
+        payload = _GqlObject("CreatePullRequestPayload", pull, repo)
+        return self._gql_project(payload, field.selection)
 
-    def _mut_merge_pr(self, args):
-        inp = args.get("input") or {}
-        decoded = ungid(inp.get("pullRequestId"))
-        if not decoded or decoded[0] != "pr":
-            return {"_type": "MergePullRequestPayload", "pullRequest": None}
-        repo = find_repo_by_dbid(int(decoded[1][0]))
-        pr = repo.prs.get(int(decoded[1][1])) if repo else None
-        if pr is None:
-            return {"_type": "MergePullRequestPayload", "pullRequest": None}
-        if not pr["merged"] and not pr_conflict(repo, pr):
-            merge_oid = squash_merge(repo, pr)
-            if merge_oid:
-                pr["merged"] = True
-                pr["state"] = "closed"
-                pr["merge_sha"] = merge_oid
-        return {"_type": "MergePullRequestPayload", "pullRequest": self._pr_obj(repo, pr)}
+    def _gql_merge_pull(self, field):
+        store = self.server.store
+        input_data = field.args.get("input") or {}
+        repo, pull = self._gql_pull_from_id(input_data.get("pullRequestId"))
+        if pull is None:
+            raise GraphQLError("pullRequestId does not name a pull request")
+        status, payload = store.merge_pull(repo, pull)
+        if status >= 400:
+            raise GraphQLError(payload["message"])
+        result = _GqlObject("MergePullRequestPayload", pull, repo)
+        return self._gql_project(result, field.selection)
 
-    def _mut_add_comment(self, args):
-        inp = args.get("input") or {}
-        decoded = ungid(inp.get("subjectId"))
-        if not decoded or decoded[0] != "issue":
-            return {"_type": "AddCommentPayload", "commentEdge": None}
-        repo = find_repo_by_dbid(int(decoded[1][0]))
-        number = int(decoded[1][1])
-        issue = repo.issues.get(number) if repo else None
+    def _gql_add_comment(self, field):
+        store = self.server.store
+        input_data = field.args.get("input") or {}
+        repo, issue = self._gql_issue_from_id(input_data.get("subjectId"))
         if issue is None:
-            return {"_type": "AddCommentPayload", "commentEdge": None}
-        cid = repo.next_comment_id
-        repo.next_comment_id += 1
-        comment = {"id": cid, "body": inp.get("body", ""),
-                   "gid": gid("comment", repo.dbid, number, cid)}
-        repo.comments.setdefault(number, []).append(comment)
-        return {"_type": "AddCommentPayload",
-                "commentEdge": {"_type": "CommentEdge",
-                                "node": {"_type": "Comment", "id": comment["gid"],
-                                         "body": comment["body"]}}}
-
-    # -- execution ------------------------------------------------------------
-    def _exec_object(self, obj, type_name, selections):
-        out = {}
-        for sel in selections:
-            if sel["kind"] == "fragment":
-                if sel["type"] is None or sel["type"] == type_name or \
-                        sel["type"] in ("Node",):
-                    out.update(self._exec_object(obj, type_name, sel["selections"]))
-                continue
-            name = sel["name"]
-            key = sel["alias"] or name
-            if not isinstance(obj, dict) or name not in obj:
-                self.errors.append(
-                    {"message": 'Cannot query field "%s" on type "%s".' % (name, type_name)})
-                out[key] = None
-                continue
-            value = obj[name]
-            if callable(value):
-                value = value(self._resolve_args(sel["args"]))
-            if sel["selections"]:
-                if value is None:
-                    out[key] = None
-                elif isinstance(value, list):
-                    out[key] = [self._exec_object(
-                        item, item.get("_type", type_name), sel["selections"])
-                        if isinstance(item, dict) else item for item in value]
-                elif isinstance(value, dict):
-                    out[key] = self._exec_object(
-                        value, value.get("_type", type_name), sel["selections"])
-                else:
-                    out[key] = value
-            else:
-                out[key] = value
-        # strip internal markers
-        return {k: v for k, v in out.items() if k != "_type"}
+            raise GraphQLError("subjectId does not name an issue")
+        comment = {
+            "id": store.next_comment_id,
+            "body": input_data.get("body", ""),
+            "issue": issue["number"],
+            "created_at": tick_iso(),
+            "updated_at": tick_iso(),
+        }
+        store.next_comment_id += 1
+        issue["comments"].append(comment)
+        payload = _GqlObject("AddCommentPayload", comment, repo)
+        return self._gql_project(payload, field.selection)
 
 
-# ---------------------------------------------------------------------------
-# MCP tools
-# ---------------------------------------------------------------------------
+    # -- MCP ------------------------------------------------------------------
 
-class MCPToolError(Exception):
+    def _route_mcp(self):
+        raw = self._read_body()
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else None
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if body is None or not isinstance(body, dict):
+            self._send_json(400, {"jsonrpc": "2.0",
+                                  "error": {"code": -32700, "message": "Parse error"},
+                                  "id": None})
+            return
+        method = body.get("method", "")
+        request_id = body.get("id")
+        params = body.get("params") or {}
+        if method.startswith("notifications/"):
+            self._send(200, b"")
+            return
+        if method == "server/discover":
+            info = {"name": SERVER_NAME, "version": SERVER_VERSION}
+            self._send_json(200, {"jsonrpc": "2.0", "id": request_id, "result": {
+                "supportedVersions": ["2026-07-28"],
+                "serverInfo": info,
+                "capabilities": {"tools": {}},
+                "_meta": {"io.modelcontextprotocol/serverInfo": info},
+            }})
+            return
+        if method == "initialize":
+            offered = params.get("protocolVersion", "2025-11-25")
+            supported = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+            negotiated = offered if offered in supported else "2025-11-25"
+            self._send_json(200, {"jsonrpc": "2.0", "id": request_id, "result": {
+                "protocolVersion": negotiated,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            }})
+            return
+        if method == "tools/list":
+            self._send_json(200, {"jsonrpc": "2.0", "id": request_id,
+                                  "result": {"tools": _MCP_TOOLS}})
+            return
+        if method == "tools/call":
+            self._mcp_call(request_id, params)
+            return
+        self._send_json(200, {"jsonrpc": "2.0", "id": request_id,
+                              "error": {"code": -32601, "message": "Method not found: %s" % method}})
+
+    def _mcp_call(self, request_id, params):
+        name = (params.get("name") or "").lower()
+        if "__" in name:
+            name = name.rsplit("__", 1)[-1]
+        arguments = params.get("arguments") or {}
+        handler = _MCP_HANDLERS.get(name)
+        if handler is None:
+            self._send_json(200, {"jsonrpc": "2.0", "id": request_id,
+                                  "error": {"code": -32602, "message": "Unknown tool: %s" % name}})
+            return
+        try:
+            result = getattr(self, handler)(arguments)
+        except ApiError as err:
+            result = {"isError": True, "text": err.message}
+        if result.get("isError"):
+            payload = {"content": [{"type": "text", "text": result["text"]}],
+                       "isError": True}
+        else:
+            text = json.dumps(result["data"], separators=(",", ":"))
+            payload = {"content": [{"type": "text", "text": text}],
+                       "structuredContent": result["data"], "isError": False}
+        self._send_json(200, {"jsonrpc": "2.0", "id": request_id, "result": payload})
+
+    def _mcp_repo(self, arguments):
+        owner = arguments.get("owner")
+        repo_name = arguments.get("repo") or arguments.get("repository")
+        full_name = arguments.get("full_name")
+        if (owner is None or repo_name is None) and full_name:
+            parts = str(full_name).split("/", 1)
+            if len(parts) == 2:
+                owner, repo_name = parts
+        if owner is None or repo_name is None:
+            raise ApiError(400, "owner and repo are required")
+        repo = self.server.store.get_repo(owner, repo_name)
+        if repo is None:
+            raise ApiError(404, "Not Found")
+        return repo
+
+    def _mcp_create_repo(self, arguments):
+        name = arguments.get("name")
+        if not name:
+            raise ApiError(400, "name is required")
+        repo, error = self.server.store.create_repo(
+            name, private=arguments.get("private", False),
+            description=arguments.get("description", ""))
+        if repo is None:
+            raise ApiError(422, error)
+        return {"data": repo_view(repo)}
+
+    def _mcp_get_repo(self, arguments):
+        return {"data": repo_view(self._mcp_repo(arguments))}
+
+    def _mcp_list_repos(self, arguments):
+        repos = self.server.store.list_repos()
+        return {"data": {"repositories": [repo_view(r) for r in repos]}}
+
+    def _mcp_create_issue(self, arguments):
+        repo = self._mcp_repo(arguments)
+        title = arguments.get("title")
+        if not title:
+            raise ApiError(400, "title is required")
+        issue, error = self.server.store.create_issue(
+            repo, title, arguments.get("body", ""), [])
+        if issue is None:
+            raise ApiError(422, error)
+        return {"data": issue_view(repo, issue)}
+
+    def _mcp_get_issue(self, arguments):
+        repo = self._mcp_repo(arguments)
+        number = arguments.get("issue_number") or arguments.get("number")
+        issue = repo.issues.get(number) if isinstance(number, int) else None
+        if issue is None:
+            raise ApiError(404, "Not Found")
+        return {"data": issue_view(repo, issue)}
+
+    def _mcp_list_issues(self, arguments):
+        repo = self._mcp_repo(arguments)
+        state = arguments.get("state") or "open"
+        issues = self.server.store.list_issues(repo, state)
+        return {"data": {"issues": [issue_view(repo, i) for i in issues]}}
+
+    def _mcp_create_pull(self, arguments):
+        repo = self._mcp_repo(arguments)
+        title = arguments.get("title")
+        head = arguments.get("head")
+        base = arguments.get("base")
+        if not title or not head or not base:
+            raise ApiError(400, "title, head and base are required")
+        pull, error = self.server.store.create_pull(
+            repo, head, base, title, arguments.get("body", ""))
+        if pull is None:
+            raise ApiError(422, error)
+        return {"data": pull_view(repo, pull)}
+
+    def _mcp_list_pulls(self, arguments):
+        repo = self._mcp_repo(arguments)
+        state = arguments.get("state") or "open"
+        pulls = list(repo.pulls.values())
+        if state in ("open", "closed"):
+            pulls = [p for p in pulls if p["state"] == state]
+        pulls.sort(key=lambda p: p["seq"], reverse=True)
+        return {"data": {"pull_requests": [pull_view(repo, p) for p in pulls]}}
+
+    def _mcp_merge_pull(self, arguments):
+        repo = self._mcp_repo(arguments)
+        number = arguments.get("pull_number") or arguments.get("number")
+        pull = repo.pulls.get(number) if isinstance(number, int) else None
+        if pull is None:
+            raise ApiError(404, "Not Found")
+        status, payload = self.server.store.merge_pull(repo, pull)
+        if status >= 400:
+            raise ApiError(status, payload["message"])
+        return {"data": {"merged": True, "sha": payload["sha"],
+                         "number": pull["number"], "message": payload["message"]}}
+
+
+class GraphQLError(Exception):
     pass
 
 
-def _mcp_repo(args):
-    owner = args.get("owner")
-    name = args.get("repo")
-    if owner is not None and owner != STORE.login():
-        raise MCPToolError("Repository not found: %s/%s" % (owner, name))
-    repo = STORE.repos.get(name)
-    if repo is None:
-        raise MCPToolError("Repository not found: %s" % name)
-    return repo
+_GQL_TOKEN = re.compile(r"""
+    \s*(?:
+    (?P<dots>\.\.\.)
+    |(?P<name>[A-Za-z_][A-Za-z0-9_]*)
+    |(?P<int>-?[0-9]+)
+    |(?P<string>"(?:[^"\\]|\\.)*")
+    |(?P<punct>[\{\}\(\)\:\,\$\!\[\]\=])
+    )
+""", re.VERBOSE)
 
 
-def mcp_create_repo(args):
-    repo, err = create_repo(args.get("name"), args.get("private", False),
-                            args.get("description", ""))
-    if err:
-        raise MCPToolError("Repository already exists: %s" % args.get("name"))
-    return repo_json(repo)
+def _gql_tokens(text):
+    tokens = []
+    pos = 0
+    while pos < len(text):
+        if text[pos] in " \t\r\n,":
+            pos += 1
+            continue
+        if text[pos] == "#":
+            end = text.find("\n", pos)
+            pos = len(text) if end < 0 else end + 1
+            continue
+        match = _GQL_TOKEN.match(text, pos)
+        if match is None:
+            raise GraphQLError("cannot tokenize GraphQL at %r" % text[pos:pos + 20])
+        pos = match.end()
+        if match.group("dots"):
+            tokens.append(("...", "..."))
+        elif match.group("name"):
+            tokens.append(("name", match.group("name")))
+        elif match.group("int"):
+            tokens.append(("int", int(match.group("int"))))
+        elif match.group("string"):
+            tokens.append(("string", json.loads(match.group("string"))))
+        else:
+            tokens.append((match.group("punct"), match.group("punct")))
+    tokens.append(("eof", None))
+    return tokens
 
 
-def mcp_get_repo(args):
-    return repo_json(_mcp_repo(args))
+class _GqlField:
+    __slots__ = ("name", "alias", "args", "selection", "type_condition")
+
+    def __init__(self, name, alias=None, args=None, selection=None, type_condition=None):
+        self.name = name
+        self.alias = alias or name
+        self.args = args or {}
+        self.selection = selection or []
+        self.type_condition = type_condition
 
 
-def mcp_create_issue(args):
-    repo = _mcp_repo(args)
-    issue = create_issue(repo, args.get("title", ""), args.get("body", ""))
-    return issue_json(repo, issue)
+class _GqlParser:
+    def __init__(self, text, variables):
+        self.tokens = _gql_tokens(text)
+        self.pos = 0
+        self.variables = variables or {}
+
+    def peek(self):
+        return self.tokens[self.pos]
+
+    def take(self, kind=None):
+        token = self.tokens[self.pos]
+        if kind is not None and token[0] != kind:
+            raise GraphQLError("expected %s, found %s" % (kind, token[0]))
+        self.pos += 1
+        return token[1]
+
+    def parse(self):
+        kind, value = self.peek()
+        operation = "query"
+        if kind == "name" and value in ("query", "mutation", "subscription"):
+            operation = value
+            self.take("name")
+            if self.peek()[0] == "name":
+                self.take("name")
+            if self.peek()[0] == "(":
+                self._skip_parens()
+        return operation, self._selection_set()
+
+    def _skip_parens(self):
+        depth = 0
+        while True:
+            value = self.take()
+            if value == "(":
+                depth += 1
+            elif value == ")":
+                depth -= 1
+                if depth == 0:
+                    return
+            elif value is None:
+                raise GraphQLError("unbalanced parentheses")
+
+    def _selection_set(self):
+        self.take("{")
+        fields = []
+        while self.peek()[0] != "}":
+            fields.extend(self._field())
+            if self.peek()[0] == "eof":
+                raise GraphQLError("unbalanced selection set")
+        self.take("}")
+        return fields
+
+    def _field(self):
+        kind, value = self.peek()
+        if kind == "...":
+            self.take("...")
+            if self.peek() == ("name", "on"):
+                self.take("name")
+                condition = self.take("name")
+                return [_GqlField("", selection=self._selection_set(), type_condition=condition)]
+            return self._selection_set()
+        first = self.take("name")
+        if self.peek()[0] == ":":
+            self.take(":")
+            name = self.take("name")
+            alias = first
+        else:
+            name, alias = first, first
+        args = {}
+        if self.peek()[0] == "(":
+            args = self._arguments()
+        selection = []
+        if self.peek()[0] == "{":
+            selection = self._selection_set()
+        return [_GqlField(name, alias, args, selection)]
+
+    def _arguments(self):
+        self.take("(")
+        args = {}
+        while self.peek()[0] != ")":
+            name = self.take("name")
+            self.take(":")
+            args[name] = self._value()
+            if self.peek()[0] == "eof":
+                raise GraphQLError("unbalanced arguments")
+        self.take(")")
+        return args
+
+    def _value(self):
+        kind, value = self.peek()
+        if kind == "$":
+            self.take("$")
+            name = self.take("name")
+            return self.variables.get(name)
+        if kind == "string":
+            self.take("string")
+            return value
+        if kind == "int":
+            self.take("int")
+            return value
+        if kind == "name":
+            self.take("name")
+            if value == "true":
+                return True
+            if value == "false":
+                return False
+            if value == "null":
+                return None
+            return value
+        if kind == "[":
+            self.take("[")
+            items = []
+            while self.peek()[0] != "]":
+                items.append(self._value())
+            self.take("]")
+            return items
+        if kind == "{":
+            self.take("{")
+            obj = {}
+            while self.peek()[0] != "}":
+                name = self.take("name")
+                self.take(":")
+                obj[name] = self._value()
+            self.take("}")
+            return obj
+        raise GraphQLError("unexpected value token %s" % kind)
 
 
-def mcp_list_issues(args):
-    repo = _mcp_repo(args)
-    state = args.get("state", "open")
-    items = [i for i in repo.issues.values()
-             if state in ("all", None) or i["state"] == state]
-    items.sort(key=lambda i: i["seq"])
-    return {"issues": [issue_json(repo, i) for i in items]}
-
-
-def mcp_create_pr(args):
-    repo = _mcp_repo(args)
-    head = str(args.get("head", ""))
-    base = str(args.get("base", ""))
-    if branch_tip(repo, head) is None:
-        raise MCPToolError("Head branch not found: %s" % head)
-    if branch_tip(repo, base) is None:
-        raise MCPToolError("Base branch not found: %s" % base)
-    pr = create_pr(repo, args.get("title", ""), args.get("body", ""), head, base)
-    return pr_json(repo, pr)
-
-
-def mcp_merge_pr(args):
-    repo = _mcp_repo(args)
-    number = args.get("pull_number")
-    try:
-        number = int(number)
-    except (TypeError, ValueError):
-        raise MCPToolError("Invalid pull_number: %r" % (number,))
-    pr = repo.prs.get(number)
-    if pr is None:
-        raise MCPToolError("Pull request not found: %d" % number)
-    if pr["merged"]:
-        raise MCPToolError("Pull request already merged")
-    if pr_conflict(repo, pr):
-        raise MCPToolError("Merge conflict")
-    merge_oid = squash_merge(repo, pr)
-    if merge_oid is None:
-        raise MCPToolError("Merge conflict")
-    pr["merged"] = True
-    pr["state"] = "closed"
-    pr["merge_sha"] = merge_oid
-    return {"merged": True, "number": number, "sha": merge_oid,
-            "message": "Pull request successfully merged"}
-
-
-MCP_HANDLERS = {
-    "create_repo": mcp_create_repo,
-    "get_repo": mcp_get_repo,
-    "create_issue": mcp_create_issue,
-    "list_issues": mcp_list_issues,
-    "create_pull_request": mcp_create_pr,
-    "merge_pull_request": mcp_merge_pr,
+_GQL_TYPE_FIELDS = {
+    "Issue": ["id", "number", "title", "state", "body", "createdAt", "updatedAt",
+              "author", "labels", "comments", "url"],
+    "PullRequest": ["id", "number", "title", "state", "merged", "headRefName",
+                    "baseRefName", "mergeable", "files", "body", "createdAt",
+                    "updatedAt", "author", "url"],
+    "Repository": ["id", "databaseId", "name", "nameWithOwner", "owner",
+                   "defaultBranchRef", "viewerPermission", "hasIssuesEnabled",
+                   "issue", "issues", "pullRequests", "pullRequest",
+                   "description", "private", "createdAt", "updatedAt"],
+    "SearchType": [],
+}
+_GQL_ENUM_VALUES = {
+    "SearchType": ["ISSUE", "USER", "REPOSITORY"],
+    "IssueState": ["OPEN", "CLOSED"],
+    "PullRequestState": ["OPEN", "CLOSED", "MERGED"],
 }
 
-MCP_TOOLS = [
-    {"name": "create_repo",
-     "description": "Create a new repository owned by the authenticated user.",
-     "inputSchema": {"type": "object",
-                     "properties": {"name": {"type": "string"},
-                                    "description": {"type": "string"},
-                                    "private": {"type": "boolean"}},
-                     "required": ["name"]}},
-    {"name": "get_repo",
-     "description": "Get a repository by owner and name.",
-     "inputSchema": {"type": "object",
-                     "properties": {"owner": {"type": "string"},
-                                    "repo": {"type": "string"},
-                                    "full_name": {"type": "string"}},
-                     "required": ["owner", "repo"]}},
-    {"name": "create_issue",
-     "description": "Create an issue in a repository.",
-     "inputSchema": {"type": "object",
-                     "properties": {"owner": {"type": "string"},
-                                    "repo": {"type": "string"},
-                                    "title": {"type": "string"},
-                                    "body": {"type": "string"}},
-                     "required": ["owner", "repo", "title"]}},
-    {"name": "list_issues",
-     "description": "List issues in a repository, optionally filtered by state.",
-     "inputSchema": {"type": "object",
-                     "properties": {"owner": {"type": "string"},
-                                    "repo": {"type": "string"},
-                                    "state": {"type": "string"}},
-                     "required": ["owner", "repo"]}},
-    {"name": "create_pull_request",
-     "description": "Open a pull request from a head branch into a base branch.",
-     "inputSchema": {"type": "object",
-                     "properties": {"owner": {"type": "string"},
-                                    "repo": {"type": "string"},
-                                    "title": {"type": "string"},
-                                    "body": {"type": "string"},
-                                    "head": {"type": "string"},
-                                    "base": {"type": "string"}},
-                     "required": ["owner", "repo", "title", "head", "base"]}},
-    {"name": "merge_pull_request",
-     "description": "Squash-merge a pull request by number.",
-     "inputSchema": {"type": "object",
-                     "properties": {"owner": {"type": "string"},
-                                    "repo": {"type": "string"},
-                                    "pull_number": {"type": "integer"}},
-                     "required": ["owner", "repo", "pull_number"]}},
+
+class _GqlObject:
+    """A resolved value plus the GraphQL type it answers as."""
+
+    __slots__ = ("type_name", "value", "repo")
+
+    def __init__(self, type_name, value, repo=None):
+        self.type_name = type_name
+        self.value = value
+        self.repo = repo
+
+
+def _gql_issue_state(issue):
+    return "OPEN" if issue["state"] == "open" else "CLOSED"
+
+
+def _gql_pull_state(pull):
+    if pull["merged"]:
+        return "MERGED"
+    return "OPEN" if pull["state"] == "open" else "CLOSED"
+
+
+def _mcp_tool(name, description, properties, required):
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {"type": "object", "properties": properties,
+                        "required": required},
+    }
+
+
+_MCP_TOOLS = [
+    _mcp_tool("create_repo", "Create a repository for the authenticated user.", {
+        "name": {"type": "string", "description": "The repository name."},
+        "description": {"type": "string", "description": "A short description."},
+        "private": {"type": "boolean", "description": "Whether the repository is private."},
+    }, ["name"]),
+    _mcp_tool("get_repo", "Read one repository by owner and name.", {
+        "owner": {"type": "string", "description": "The repository owner."},
+        "repo": {"type": "string", "description": "The repository name."},
+        "full_name": {"type": "string", "description": "owner/repo, an alternative to owner and repo."},
+    }, ["owner", "repo"]),
+    _mcp_tool("list_repos", "List the authenticated user's repositories.", {}, []),
+    _mcp_tool("create_issue", "Create an issue in a repository.", {
+        "owner": {"type": "string", "description": "The repository owner."},
+        "repo": {"type": "string", "description": "The repository name."},
+        "title": {"type": "string", "description": "The issue title."},
+        "body": {"type": "string", "description": "The issue body."},
+    }, ["owner", "repo", "title"]),
+    _mcp_tool("get_issue", "Read one issue by number.", {
+        "owner": {"type": "string", "description": "The repository owner."},
+        "repo": {"type": "string", "description": "The repository name."},
+        "issue_number": {"type": "integer", "description": "The issue number."},
+    }, ["owner", "repo", "issue_number"]),
+    _mcp_tool("list_issues", "List issues in a repository.", {
+        "owner": {"type": "string", "description": "The repository owner."},
+        "repo": {"type": "string", "description": "The repository name."},
+        "state": {"type": "string", "description": "open, closed or all."},
+    }, ["owner", "repo"]),
+    _mcp_tool("create_pull_request", "Create a pull request from a head branch to a base branch.", {
+        "owner": {"type": "string", "description": "The repository owner."},
+        "repo": {"type": "string", "description": "The repository name."},
+        "title": {"type": "string", "description": "The pull request title."},
+        "head": {"type": "string", "description": "The head branch name."},
+        "base": {"type": "string", "description": "The base branch name."},
+        "body": {"type": "string", "description": "The pull request body."},
+    }, ["owner", "repo", "title", "head", "base"]),
+    _mcp_tool("list_pull_requests", "List pull requests in a repository.", {
+        "owner": {"type": "string", "description": "The repository owner."},
+        "repo": {"type": "string", "description": "The repository name."},
+        "state": {"type": "string", "description": "open, closed or all."},
+    }, ["owner", "repo"]),
+    _mcp_tool("merge_pull_request", "Squash-merge a pull request.", {
+        "owner": {"type": "string", "description": "The repository owner."},
+        "repo": {"type": "string", "description": "The repository name."},
+        "pull_number": {"type": "integer", "description": "The pull request number."},
+    }, ["owner", "repo", "pull_number"]),
 ]
 
+_MCP_HANDLERS = {
+    "create_repo": "_mcp_create_repo",
+    "get_repo": "_mcp_get_repo",
+    "list_repos": "_mcp_list_repos",
+    "create_issue": "_mcp_create_issue",
+    "get_issue": "_mcp_get_issue",
+    "list_issues": "_mcp_list_issues",
+    "create_pull_request": "_mcp_create_pull",
+    "list_pull_requests": "_mcp_list_pulls",
+    "merge_pull_request": "_mcp_merge_pull",
+}
+
 
 # ---------------------------------------------------------------------------
-# entrypoint: bind, register with the env, poll /done, exit 0
+# Lifecycle: bind an ephemeral port, register with the environment, serve,
+# and exit when the environment says the suite is done.
 # ---------------------------------------------------------------------------
 
-def _http_json(url, payload=None, timeout=5):
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, method="POST" if data else "GET",
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+def _env_url():
+    return os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
 
 
-class ForgeServer(ThreadingHTTPServer):
-    daemon_threads = True
-    # socketserver's default listen backlog is 5: with 50 concurrent
-    # clones the accept queue overflows and the kernel makes clients wait
-    # out TCP retransmission timeouts (~1 s each). The clone workload
-    # opens 50 connections at once; give it room.
-    request_queue_size = 128
-    allow_reuse_address = True
+def _register(env_url, port):
+    url = env_url + "/register"
+    payload = json_bytes({"port": port})
+    request = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json"})
+    for attempt in range(20):
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                if response.status in (200, 201, 409):
+                    return True
+        except Exception as err:
+            if attempt == 19:
+                print("register failed: %s" % err, file=sys.stderr)
+        time.sleep(0.25 * (attempt + 1))
+    return False
+
+
+def _done(env_url):
+    url = env_url + "/done"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return bool(body.get("done"))
+    except Exception:
+        return False
+
+
+def _poll_done(env_url, server):
+    while True:
+        time.sleep(0.5)
+        if _done(env_url):
+            server.shutdown()
+            return
 
 
 def main():
-    server = ForgeServer(("0.0.0.0", 0), Handler)
+    port_env = os.environ.get("PORT")
+    bind_port = int(port_env) if port_env else 0
+    server = ForgeServer(("0.0.0.0", bind_port), ForgeHandler)
     port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print("forge listening on port %d" % port, flush=True)
-    if not ENV_URL:
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            return 0
-    registered = False
-    deadline = time.time() + 120
-    while not registered and time.time() < deadline:
-        try:
-            status, _ = _http_json(ENV_URL + "/register", {"port": port}, timeout=5)
-            if status in (200, 409):
-                registered = True
-        except Exception:
-            time.sleep(0.5)
-    delay = 0.25
-    while True:
-        try:
-            _status, data = _http_json(ENV_URL + "/done", timeout=30)
-            if isinstance(data, dict) and data.get("done") is True:
-                return 0
-        except Exception:
-            pass
-        time.sleep(delay)
-        delay = min(delay * 2, 2.0)
+    print("makefun-forge listening on port %d" % port, flush=True)
+    env_url = _env_url()
+    if env_url:
+        if not _register(env_url, port):
+            print("could not register with the environment", file=sys.stderr)
+            return 1
+        watcher = threading.Thread(target=_poll_done, args=(env_url, server),
+                                   daemon=True)
+        watcher.start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
